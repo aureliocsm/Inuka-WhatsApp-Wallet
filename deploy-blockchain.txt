@@ -1,0 +1,510 @@
+import { ethers } from 'npm:ethers@6.13.0';
+
+// Contract ABIs
+const CHAMA_FACTORY_ABI = [
+  'function createChama(string memory name, string memory description, string memory inviteCode, uint256 sharePriceUSD, uint256 weeklyMinimum, uint256 loanInterestRate, uint256 lockupMonths) external returns (address chamaAddress)',
+  'function getChamaByInviteCode(string memory inviteCode) external view returns (address)',
+  'function getChamasByCreator(address creator) external view returns (address[] memory)',
+  'function getAllChamas() external view returns (address[] memory)',
+  'function getTotalChamas() external view returns (uint256)',
+  'function isInviteCodeAvailable(string memory inviteCode) external view returns (bool)',
+  'event ChamaCreated(address indexed chamaAddress, string inviteCode, address indexed creator, string name)',
+];
+
+const CHAMA_ABI = [
+  'function name() external view returns (string memory)',
+  'function description() external view returns (string memory)',
+  'function inviteCode() external view returns (string memory)',
+  'function creator() external view returns (address)',
+  'function sharePriceUSD() external view returns (uint256)',
+  'function weeklyMinimumContribution() external view returns (uint256)',
+  'function loanInterestRate() external view returns (uint256)',
+  'function lockupPeriodMonths() external view returns (uint256)',
+  'function memberCount() external view returns (uint256)',
+  'function totalContributions() external view returns (uint256)',
+  'function totalETHHoldings() external view returns (uint256)',
+  'function totalTZSHoldings() external view returns (uint256)',
+  'function joinChama() external',
+  'function contribute(address token, uint256 amount, uint256 amountUSD) external payable',
+  'function requestLoan(address token, uint256 amount, uint256 durationDays) external returns (uint256)',
+  'function voteOnLoan(uint256 loanId, bool approve) external',
+  'function disburseLoan(uint256 loanId) external',
+  'function repayLoan(uint256 loanId, uint256 amount) external payable',
+  'function withdraw(address token, uint256 amount) external',
+  'function getMember(address memberAddress) external view returns (tuple(address wallet, uint256 totalContributions, uint256 ethShare, uint256 tzsShare, uint256 sharesOwned, uint256 joinedAt, uint256 lastContribution, uint256 missedContributions, bool isAdmin, bool isActive))',
+  'function getLoan(uint256 loanId) external view returns (tuple(address borrower, uint256 amount, address token, uint256 interestRate, uint256 totalDue, uint256 amountRepaid, uint256 requestedAt, uint256 disbursedAt, uint256 dueDate, uint256 approvalsCount, uint256 rejectionsCount, bool isApproved, bool isDisbursed, bool isActive, bool isRepaid))',
+  'function getChamaSummary() external view returns (uint256 _totalContributions, uint256 _totalETH, uint256 _totalTZS, uint256 _memberCount, bool _isActive)',
+  'function getAllMembers() external view returns (address[] memory)',
+  'function isMember(address user) external view returns (bool)',
+  'function getRequiredVotes() external view returns (uint256)',
+  'event MemberJoined(address indexed member, uint256 timestamp)',
+  'event ContributionMade(address indexed member, address indexed token, uint256 amount, uint256 shares)',
+  'event LoanRequested(uint256 indexed loanId, address indexed borrower, uint256 amount, address token, uint256 durationDays)',
+  'event LoanVoted(uint256 indexed loanId, address indexed voter, bool approved)',
+  'event LoanApproved(uint256 indexed loanId, uint256 approvalsCount)',
+  'event LoanDisbursed(uint256 indexed loanId, address indexed borrower, uint256 amount)',
+  'event LoanRepaid(uint256 indexed loanId, address indexed borrower, uint256 amount, bool fullyRepaid)',
+  'event WithdrawalMade(address indexed member, uint256 amount, address token)',
+];
+
+const WALLET_MANAGER_ABI = [
+  'function depositETH(address user) external payable',
+  'function depositToken(address user, address token, uint256 amount) external',
+  'function withdrawETH(uint256 amount, address payable to) external',
+  'function withdrawToken(address token, uint256 amount, address to) external',
+  'function internalTransfer(address from, address to, address token, uint256 amount) external',
+  'function getBalance(address user, address token) external view returns (uint256)',
+  'function getETHBalance(address user) external view returns (uint256)',
+  'event Deposit(address indexed user, address indexed token, uint256 amount)',
+  'event Withdrawal(address indexed user, address indexed token, uint256 amount, address to)',
+  'event Transfer(address indexed from, address indexed to, address indexed token, uint256 amount)',
+];
+
+// Contract addresses
+const CHAMA_FACTORY_ADDRESS = Deno.env.get('CHAMA_FACTORY_ADDRESS') || '0x305e088651c79CF4e459386e1908c690C0cAa88f';
+const WALLET_MANAGER_ADDRESS = Deno.env.get('WALLET_MANAGER_ADDRESS') || '0x8bdF6F0C0938a2d8F61B0480d6d1a00331CCfdA8';
+const TZS_TOKEN_ADDRESS = Deno.env.get('TZS_TOKEN_ADDRESS') || '0x0000000000000000000000000000000000000000';
+const ETH_ADDRESS = '0x0000000000000000000000000000000000000000';
+
+// RPC and Explorer configuration
+const RPC_URL = Deno.env.get('BLOCKCHAIN_RPC_URL') || 'https://remix-sepolia.g.alchemy.com/v2/demo';
+const EXPLORER_BASE_URL = Deno.env.get('BLOCKCHAIN_EXPLORER_URL') || 'https://sepolia.etherscan.io';
+
+// Initialize provider
+let provider: ethers.JsonRpcProvider;
+let masterWallet: ethers.Wallet;
+
+export function initializeBlockchain() {
+  provider = new ethers.JsonRpcProvider(RPC_URL);
+  const privateKey = Deno.env.get('MASTER_WALLET_PRIVATE_KEY');
+  if (!privateKey) {
+    throw new Error('MASTER_WALLET_PRIVATE_KEY not found in environment');
+  }
+  masterWallet = new ethers.Wallet(privateKey, provider);
+  console.log('Blockchain initialized with master wallet:', masterWallet.address);
+}
+
+// Helper: Generate explorer link
+export function getExplorerLink(txHash: string): string {
+  return `${EXPLORER_BASE_URL}/tx/${txHash}`;
+}
+
+export function getAddressExplorerLink(address: string): string {
+  return `${EXPLORER_BASE_URL}/address/${address}`;
+}
+
+// Helper: Get wallet from private key
+function getWalletFromPrivateKey(encryptedPrivateKey: string): ethers.Wallet {
+  // In production, decrypt the private key first
+  // For now, assume it's already decrypted or use master wallet
+  return masterWallet;
+}
+
+// ============================================================================
+// CHAMA FACTORY FUNCTIONS
+// ============================================================================
+
+export interface CreateChamaParams {
+  name: string;
+  description: string;
+  inviteCode: string;
+  sharePriceUSD: number;
+  weeklyMinimum: number;
+  loanInterestRate: number;
+  lockupMonths: number;
+  creatorPrivateKey?: string;
+}
+
+export interface CreateChamaResult {
+  success: boolean;
+  chamaAddress?: string;
+  txHash?: string;
+  explorerLink?: string;
+  error?: string;
+}
+
+export async function createChamaOnChain(params: CreateChamaParams): Promise<CreateChamaResult> {
+  try {
+    const wallet = params.creatorPrivateKey
+      ? new ethers.Wallet(params.creatorPrivateKey, provider)
+      : masterWallet;
+
+    const factory = new ethers.Contract(CHAMA_FACTORY_ADDRESS, CHAMA_FACTORY_ABI, wallet);
+
+    // Convert USD values to 6 decimals (e.g., $10 = 10000000)
+    const sharePriceUSD = Math.floor(params.sharePriceUSD * 1e6);
+    const weeklyMinimum = Math.floor(params.weeklyMinimum * 1e6);
+
+    console.log('Creating Chama on-chain:', {
+      name: params.name,
+      inviteCode: params.inviteCode,
+      sharePriceUSD,
+      weeklyMinimum,
+      loanInterestRate: params.loanInterestRate,
+      lockupMonths: params.lockupMonths,
+    });
+
+    const tx = await factory.createChama(
+      params.name,
+      params.description,
+      params.inviteCode,
+      sharePriceUSD,
+      weeklyMinimum,
+      params.loanInterestRate,
+      params.lockupMonths
+    );
+
+    console.log('Transaction sent:', tx.hash);
+    const receipt = await tx.wait();
+    console.log('Transaction confirmed:', receipt.hash);
+
+    // Parse the ChamaCreated event to get the chama address
+    const event = receipt.logs
+      .map((log: any) => {
+        try {
+          return factory.interface.parseLog(log);
+        } catch {
+          return null;
+        }
+      })
+      .find((parsed: any) => parsed && parsed.name === 'ChamaCreated');
+
+    if (!event) {
+      throw new Error('ChamaCreated event not found');
+    }
+
+    const chamaAddress = event.args[0];
+
+    return {
+      success: true,
+      chamaAddress,
+      txHash: receipt.hash,
+      explorerLink: getExplorerLink(receipt.hash),
+    };
+  } catch (error: any) {
+    console.error('Error creating Chama on-chain:', error);
+    return {
+      success: false,
+      error: error.message || 'Unknown error',
+    };
+  }
+}
+
+export async function getChamaByInviteCodeOnChain(inviteCode: string): Promise<string | null> {
+  try {
+    const factory = new ethers.Contract(CHAMA_FACTORY_ADDRESS, CHAMA_FACTORY_ABI, provider);
+    const address = await factory.getChamaByInviteCode(inviteCode);
+    return address === ethers.ZeroAddress ? null : address;
+  } catch (error) {
+    console.error('Error getting Chama by invite code:', error);
+    return null;
+  }
+}
+
+// ============================================================================
+// CHAMA CONTRACT FUNCTIONS
+// ============================================================================
+
+export interface JoinChamaResult {
+  success: boolean;
+  txHash?: string;
+  explorerLink?: string;
+  error?: string;
+}
+
+export async function joinChamaOnChain(
+  chamaAddress: string,
+  userPrivateKey?: string
+): Promise<JoinChamaResult> {
+  try {
+    const wallet = userPrivateKey
+      ? new ethers.Wallet(userPrivateKey, provider)
+      : masterWallet;
+
+    const chama = new ethers.Contract(chamaAddress, CHAMA_ABI, wallet);
+
+    console.log('Joining Chama on-chain:', chamaAddress);
+
+    const tx = await chama.joinChama();
+    console.log('Transaction sent:', tx.hash);
+
+    const receipt = await tx.wait();
+    console.log('Transaction confirmed:', receipt.hash);
+
+    return {
+      success: true,
+      txHash: receipt.hash,
+      explorerLink: getExplorerLink(receipt.hash),
+    };
+  } catch (error: any) {
+    console.error('Error joining Chama on-chain:', error);
+    return {
+      success: false,
+      error: error.message || 'Unknown error',
+    };
+  }
+}
+
+export interface ContributeToChamaParams {
+  chamaAddress: string;
+  token: 'ETH' | 'TZS';
+  amount: string; // Amount in ETH or TZS
+  amountUSD: number; // USD value with 6 decimals
+  userPrivateKey?: string;
+  tzsTokenAddress?: string;
+}
+
+export interface ContributeToChamaResult {
+  success: boolean;
+  txHash?: string;
+  explorerLink?: string;
+  shares?: string;
+  error?: string;
+}
+
+export async function contributeToChamaOnChain(
+  params: ContributeToChamaParams
+): Promise<ContributeToChamaResult> {
+  try {
+    const wallet = params.userPrivateKey
+      ? new ethers.Wallet(params.userPrivateKey, provider)
+      : masterWallet;
+
+    const chama = new ethers.Contract(params.chamaAddress, CHAMA_ABI, wallet);
+
+    const tokenAddress = params.token === 'ETH' ? ETH_ADDRESS : (params.tzsTokenAddress || TZS_TOKEN_ADDRESS);
+    const amountWei = ethers.parseEther(params.amount);
+    const amountUSD = Math.floor(params.amountUSD * 1e6);
+
+    console.log('Contributing to Chama on-chain:', {
+      chamaAddress: params.chamaAddress,
+      token: params.token,
+      amount: params.amount,
+      amountUSD: params.amountUSD,
+    });
+
+    let tx;
+    if (params.token === 'ETH') {
+      tx = await chama.contribute(tokenAddress, amountWei, amountUSD, {
+        value: amountWei,
+      });
+    } else {
+      // For TZS, need to approve first (handled separately)
+      tx = await chama.contribute(tokenAddress, amountWei, amountUSD);
+    }
+
+    console.log('Transaction sent:', tx.hash);
+    const receipt = await tx.wait();
+    console.log('Transaction confirmed:', receipt.hash);
+
+    return {
+      success: true,
+      txHash: receipt.hash,
+      explorerLink: getExplorerLink(receipt.hash),
+    };
+  } catch (error: any) {
+    console.error('Error contributing to Chama on-chain:', error);
+    return {
+      success: false,
+      error: error.message || 'Unknown error',
+    };
+  }
+}
+
+export interface RequestLoanParams {
+  chamaAddress: string;
+  token: 'ETH' | 'TZS';
+  amount: string;
+  durationDays: number;
+  userPrivateKey?: string;
+  tzsTokenAddress?: string;
+}
+
+export interface RequestLoanResult {
+  success: boolean;
+  loanId?: number;
+  txHash?: string;
+  explorerLink?: string;
+  error?: string;
+}
+
+export async function requestLoanOnChain(params: RequestLoanParams): Promise<RequestLoanResult> {
+  try {
+    const wallet = params.userPrivateKey
+      ? new ethers.Wallet(params.userPrivateKey, provider)
+      : masterWallet;
+
+    const chama = new ethers.Contract(params.chamaAddress, CHAMA_ABI, wallet);
+
+    const tokenAddress = params.token === 'ETH' ? ETH_ADDRESS : (params.tzsTokenAddress || TZS_TOKEN_ADDRESS);
+    const amountWei = ethers.parseEther(params.amount);
+
+    console.log('Requesting loan on-chain:', {
+      chamaAddress: params.chamaAddress,
+      token: params.token,
+      amount: params.amount,
+      durationDays: params.durationDays,
+    });
+
+    const tx = await chama.requestLoan(tokenAddress, amountWei, params.durationDays);
+    console.log('Transaction sent:', tx.hash);
+
+    const receipt = await tx.wait();
+    console.log('Transaction confirmed:', receipt.hash);
+
+    // Parse the LoanRequested event to get the loan ID
+    const event = receipt.logs
+      .map((log: any) => {
+        try {
+          return chama.interface.parseLog(log);
+        } catch {
+          return null;
+        }
+      })
+      .find((parsed: any) => parsed && parsed.name === 'LoanRequested');
+
+    const loanId = event ? Number(event.args[0]) : undefined;
+
+    return {
+      success: true,
+      loanId,
+      txHash: receipt.hash,
+      explorerLink: getExplorerLink(receipt.hash),
+    };
+  } catch (error: any) {
+    console.error('Error requesting loan on-chain:', error);
+    return {
+      success: false,
+      error: error.message || 'Unknown error',
+    };
+  }
+}
+
+export interface VoteLoanResult {
+  success: boolean;
+  txHash?: string;
+  explorerLink?: string;
+  error?: string;
+}
+
+export async function voteOnLoanOnChain(
+  chamaAddress: string,
+  loanId: number,
+  approve: boolean,
+  userPrivateKey?: string
+): Promise<VoteLoanResult> {
+  try {
+    const wallet = userPrivateKey
+      ? new ethers.Wallet(userPrivateKey, provider)
+      : masterWallet;
+
+    const chama = new ethers.Contract(chamaAddress, CHAMA_ABI, wallet);
+
+    console.log('Voting on loan on-chain:', { chamaAddress, loanId, approve });
+
+    const tx = await chama.voteOnLoan(loanId, approve);
+    console.log('Transaction sent:', tx.hash);
+
+    const receipt = await tx.wait();
+    console.log('Transaction confirmed:', receipt.hash);
+
+    return {
+      success: true,
+      txHash: receipt.hash,
+      explorerLink: getExplorerLink(receipt.hash),
+    };
+  } catch (error: any) {
+    console.error('Error voting on loan on-chain:', error);
+    return {
+      success: false,
+      error: error.message || 'Unknown error',
+    };
+  }
+}
+
+// ============================================================================
+// VIEW FUNCTIONS
+// ============================================================================
+
+export async function getChamaSummaryOnChain(chamaAddress: string) {
+  try {
+    const chama = new ethers.Contract(chamaAddress, CHAMA_ABI, provider);
+    const summary = await chama.getChamaSummary();
+    return {
+      totalContributions: Number(summary[0]) / 1e6, // Convert from 6 decimals
+      totalETH: ethers.formatEther(summary[1]),
+      totalTZS: ethers.formatEther(summary[2]),
+      memberCount: Number(summary[3]),
+      isActive: summary[4],
+    };
+  } catch (error) {
+    console.error('Error getting Chama summary:', error);
+    return null;
+  }
+}
+
+export async function isMemberOnChain(chamaAddress: string, userAddress: string): Promise<boolean> {
+  try {
+    const chama = new ethers.Contract(chamaAddress, CHAMA_ABI, provider);
+    return await chama.isMember(userAddress);
+  } catch (error) {
+    console.error('Error checking membership:', error);
+    return false;
+  }
+}
+
+export async function getMemberDetailsOnChain(chamaAddress: string, userAddress: string) {
+  try {
+    const chama = new ethers.Contract(chamaAddress, CHAMA_ABI, provider);
+    const member = await chama.getMember(userAddress);
+    return {
+      wallet: member[0],
+      totalContributions: Number(member[1]) / 1e6,
+      ethShare: ethers.formatEther(member[2]),
+      tzsShare: ethers.formatEther(member[3]),
+      sharesOwned: ethers.formatEther(member[4]),
+      joinedAt: new Date(Number(member[5]) * 1000),
+      lastContribution: Number(member[6]) > 0 ? new Date(Number(member[6]) * 1000) : null,
+      missedContributions: Number(member[7]),
+      isAdmin: member[8],
+      isActive: member[9],
+    };
+  } catch (error) {
+    console.error('Error getting member details:', error);
+    return null;
+  }
+}
+
+export async function getLoanDetailsOnChain(chamaAddress: string, loanId: number) {
+  try {
+    const chama = new ethers.Contract(chamaAddress, CHAMA_ABI, provider);
+    const loan = await chama.getLoan(loanId);
+    return {
+      borrower: loan[0],
+      amount: ethers.formatEther(loan[1]),
+      token: loan[2],
+      interestRate: Number(loan[3]),
+      totalDue: ethers.formatEther(loan[4]),
+      amountRepaid: ethers.formatEther(loan[5]),
+      requestedAt: new Date(Number(loan[6]) * 1000),
+      disbursedAt: Number(loan[7]) > 0 ? new Date(Number(loan[7]) * 1000) : null,
+      dueDate: new Date(Number(loan[8]) * 1000),
+      approvalsCount: Number(loan[9]),
+      rejectionsCount: Number(loan[10]),
+      isApproved: loan[11],
+      isDisbursed: loan[12],
+      isActive: loan[13],
+      isRepaid: loan[14],
+    };
+  } catch (error) {
+    console.error('Error getting loan details:', error);
+    return null;
+  }
+}
+
+// Initialize on module load
+try {
+  initializeBlockchain();
+} catch (error) {
+  console.error('Failed to initialize blockchain:', error);
+}

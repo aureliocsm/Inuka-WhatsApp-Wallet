@@ -1,0 +1,2715 @@
+import { createClient } from 'npm:@supabase/supabase-js@2.86.2';
+import { ethers } from 'npm:ethers@6.16.0';
+import CryptoJS from 'npm:crypto-js@4.2.0';
+import 'jsr:@supabase/functions-js/edge-runtime.d.ts';
+import {
+  createChamaOnChain,
+  joinChamaOnChain,
+  contributeToChamaOnChain,
+  requestLoanOnChain,
+  voteOnLoanOnChain,
+  getExplorerLink,
+  getAddressExplorerLink,
+} from './blockchain.ts';
+
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Client-Info, Apikey',
+};
+
+// Environment variables
+const META_WEBHOOK_VERIFY_TOKEN = Deno.env.get('META_WEBHOOK_VERIFY_TOKEN');
+const META_ACCESS_TOKEN = Deno.env.get('META_ACCESS_TOKEN');
+const META_PHONE_NUMBER_ID = Deno.env.get('META_PHONE_NUMBER_ID');
+const ENCRYPTION_KEY = Deno.env.get('ENCRYPTION_KEY');
+const ALCHEMY_API_KEY = Deno.env.get('ALCHEMY_API_KEY');
+const ZENO_API_KEY = Deno.env.get('ZENO_API_KEY');
+const SUPABASE_URL = Deno.env.get('SUPABASE_URL');
+const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');
+const FX_RATES_API_KEY = Deno.env.get('FX_RATES_API_KEY') || 'demo';
+
+// Constants
+const APP_NAME = '🌳🇹🇿 INUKA Pay';
+const APP_DESCRIPTION = 'Your gateway to financial freedom through crypto savings and group lending';
+const SESSION_TIMEOUT_MS = 15 * 60 * 1000;
+const WEBHOOK_URL = `${SUPABASE_URL}/functions/v1/zeno-webhook`;
+const ZENO_API_URL = 'https://zenoapi.com/api/payments';
+const FX_RATES_API_URL = 'https://api.exchangerate-api.io/v4/latest/USD';
+
+// RPC Configuration
+const SCROLL_SEPOLIA_RPC_URL = ALCHEMY_API_KEY
+  ? `https://scroll-sepolia.g.alchemy.com/v2/${ALCHEMY_API_KEY}`
+  : 'https://sepolia-rpc.scroll.io';
+
+const SCROLL_SEPOLIA_CHAIN_ID = 534351;
+const SCROLL_SEPOLIA_EXPLORER = 'https://sepolia.scrollscan.com';
+const NETWORK = 'scroll-sepolia';
+
+// Token configurations - TZS replaces USDT
+const TOKENS = {
+  ETH: {
+    name: 'Ethereum',
+    symbol: 'ETH',
+    decimals: 18,
+    contractAddress: null,
+  },
+  TZS: {
+    name: 'Tanzanian Shilling',
+    symbol: 'TZS',
+    decimals: 6,
+    contractAddress: '0x9e47f86a074463f7f51063761f4692AC04770a40',
+    abi: [
+      'function balanceOf(address owner) view returns (uint256)',
+      'function transfer(address to, uint256 amount) returns (bool)',
+      'function allowance(address owner, address spender) view returns (uint256)',
+      'function approve(address spender, uint256 amount) returns (bool)'
+    ]
+  }
+};
+
+const supabase = createClient(SUPABASE_URL!, SUPABASE_SERVICE_ROLE_KEY!);
+const META_API_URL = `https://graph.facebook.com/v21.0/${META_PHONE_NUMBER_ID}/messages`;
+
+// ============================================================================
+// EXCHANGE RATE MANAGEMENT
+// ============================================================================
+interface FXRates {
+  ETH_USD: number;
+  USD_TZS: number;
+  ETH_TZS: number;
+  lastUpdated: number;
+}
+
+let cachedFXRates: FXRates | null = null;
+const FX_CACHE_TTL = 5 * 60 * 1000;
+
+async function fetchRealTimeFXRates(): Promise<FXRates> {
+  const now = Date.now();
+  if (cachedFXRates && (now - cachedFXRates.lastUpdated) < FX_CACHE_TTL) {
+    return cachedFXRates;
+  }
+
+  try {
+    const fxResponse = await fetch(`${FX_RATES_API_URL}?apikey=${FX_RATES_API_KEY}`);
+    const fxData = await fxResponse.json();
+    const usdToTzs = fxData.rates?.TZS || 2500;
+
+    const ethResponse = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd');
+    const ethData = await ethResponse.json();
+    const ethToUsd = ethData.ethereum?.usd || 2000;
+    const ethToTzs = ethToUsd * usdToTzs;
+
+    cachedFXRates = {
+      ETH_USD: ethToUsd,
+      USD_TZS: usdToTzs,
+      ETH_TZS: ethToTzs,
+      lastUpdated: now
+    };
+
+    await supabase.from('fx_rates').upsert([
+      { currency_pair: 'ETH_USD', rate: ethToUsd, last_updated: new Date().toISOString() },
+      { currency_pair: 'USD_TZS', rate: usdToTzs, last_updated: new Date().toISOString() },
+      { currency_pair: 'ETH_TZS', rate: ethToTzs, last_updated: new Date().toISOString() }
+    ], { onConflict: 'currency_pair' });
+
+    return cachedFXRates;
+  } catch (error) {
+    console.error('Error fetching FX rates:', error);
+    const { data } = await supabase.from('fx_rates').select('*');
+    if (data && data.length > 0) {
+      const rates: any = {};
+      data.forEach(row => { rates[row.currency_pair] = row.rate; });
+      cachedFXRates = {
+        ETH_USD: rates.ETH_USD || 2000,
+        USD_TZS: rates.USD_TZS || 2500,
+        ETH_TZS: rates.ETH_TZS || 5000000,
+        lastUpdated: now
+      };
+      return cachedFXRates;
+    }
+    return { ETH_USD: 2000, USD_TZS: 2500, ETH_TZS: 5000000, lastUpdated: now };
+  }
+}
+
+async function convertCurrency(amount: number, from: string, to: string): Promise<number> {
+  if (from === to) return amount;
+  const rates = await fetchRealTimeFXRates();
+  let result = amount;
+
+  if (from === 'ETH' && to === 'TZS') result = amount * rates.ETH_TZS;
+  else if (from === 'TZS' && to === 'ETH') result = amount / rates.ETH_TZS;
+  else if (from === 'ETH' && to === 'USD') result = amount * rates.ETH_USD;
+  else if (from === 'USD' && to === 'ETH') result = amount / rates.ETH_USD;
+  else if (from === 'USD' && to === 'TZS') result = amount * rates.USD_TZS;
+  else if (from === 'TZS' && to === 'USD') result = amount / rates.USD_TZS;
+
+  return parseFloat(result.toFixed(6));
+}
+
+// ============================================================================
+// PROVIDER & WALLET MANAGEMENT
+// ============================================================================
+let providerInstance: ethers.JsonRpcProvider | null = null;
+
+function getProvider() {
+  if (providerInstance) return providerInstance;
+  const network = new ethers.Network('scroll-sepolia', SCROLL_SEPOLIA_CHAIN_ID);
+  providerInstance = new ethers.JsonRpcProvider(SCROLL_SEPOLIA_RPC_URL, network, {
+    staticNetwork: network
+  });
+  return providerInstance;
+}
+
+const balanceCache = new Map<string, { eth: string; tzs: string; timestamp: number }>();
+const CACHE_TTL = 30000;
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [address, data] of balanceCache.entries()) {
+    if (now - data.timestamp > CACHE_TTL) {
+      balanceCache.delete(address);
+    }
+  }
+}, 60000);
+
+// ============================================================================
+// ENCRYPTION & SECURITY UTILITIES
+// ============================================================================
+function encrypt(text: string): string {
+  return CryptoJS.AES.encrypt(text, ENCRYPTION_KEY!).toString();
+}
+
+function decrypt(encryptedText: string): string {
+  const bytes = CryptoJS.AES.decrypt(encryptedText, ENCRYPTION_KEY!);
+  return bytes.toString(CryptoJS.enc.Utf8);
+}
+
+function hashPin(pin: string): string {
+  return CryptoJS.SHA256(pin + ENCRYPTION_KEY).toString();
+}
+
+function isValidPinFormat(pin: string): boolean {
+  return /^\d{4,6}$/.test(pin.toString().trim());
+}
+
+function formatBalance(balance: string | number): string {
+  const num = parseFloat(balance.toString());
+  if (num === 0) return '0';
+  if (num < 0.0001) return num.toExponential(4);
+  return num.toFixed(6).replace(/\.?0+$/, '');
+}
+
+function formatTZS(amount: number): string {
+  return Math.round(amount).toLocaleString('en-US');
+}
+
+function formatUSD(amount: number): string {
+  return amount.toFixed(2);
+}
+
+function isValidAddress(address: string): boolean {
+  return ethers.isAddress(address);
+}
+
+function generateOrderId(userId: string): string {
+  const timestamp = Date.now();
+  const random = Math.floor(Math.random() * 10000);
+  return `MM-${userId.substring(0, 8)}-${timestamp}-${random}`;
+}
+
+// ============================================================================
+// WALLET OPERATIONS
+// ============================================================================
+function createWallet() {
+  const wallet = ethers.Wallet.createRandom();
+  return {
+    address: wallet.address,
+    privateKey: wallet.privateKey,
+    mnemonic: wallet.mnemonic!.phrase,
+  };
+}
+
+function getWalletFromEncrypted(encryptedPrivateKey: string) {
+  const privateKey = decrypt(encryptedPrivateKey);
+  return new ethers.Wallet(privateKey, getProvider());
+}
+
+async function getTokenBalance(address: string, tokenSymbol: string): Promise<string> {
+  const provider = getProvider();
+  if (tokenSymbol === 'ETH') {
+    const balance = await provider.getBalance(address);
+    return ethers.formatEther(balance);
+  } else if (tokenSymbol === 'TZS') {
+    const token = TOKENS.TZS;
+    const contract = new ethers.Contract(token.contractAddress!, token.abi!, provider);
+    const balance = await contract.balanceOf(address);
+    return ethers.formatUnits(balance, token.decimals);
+  }
+  return '0';
+}
+
+async function getAllBalances(address: string): Promise<{ eth: string; tzs: string }> {
+  const cached = balanceCache.get(address);
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+    return { eth: cached.eth, tzs: cached.tzs };
+  }
+
+  const [ethBalance, tzsBalance] = await Promise.all([
+    getTokenBalance(address, 'ETH'),
+    getTokenBalance(address, 'TZS')
+  ]);
+
+  balanceCache.set(address, {
+    eth: ethBalance,
+    tzs: tzsBalance,
+    timestamp: Date.now()
+  });
+
+  return { eth: ethBalance, tzs: tzsBalance };
+}
+
+async function sendToken(encryptedPrivateKey: string, toAddress: string, amount: string, tokenSymbol: string) {
+  const wallet = getWalletFromEncrypted(encryptedPrivateKey);
+  if (tokenSymbol === 'ETH') {
+    const tx = await wallet.sendTransaction({
+      to: toAddress,
+      value: ethers.parseEther(amount),
+    });
+    return tx;
+  } else if (tokenSymbol === 'TZS') {
+    const token = TOKENS.TZS;
+    const contract = new ethers.Contract(token.contractAddress!, token.abi!, wallet);
+    const amountInUnits = ethers.parseUnits(amount, token.decimals);
+    const tx = await contract.transfer(toAddress, amountInUnits);
+    return tx;
+  }
+  throw new Error(`Unsupported token: ${tokenSymbol}`);
+}
+
+// ============================================================================
+// ZENO PAYMENT INTEGRATION
+// ============================================================================
+function formatPhoneNumber(phone: string): string {
+  if (phone.startsWith('255')) {
+    return '0' + phone.substring(3);
+  }
+  return phone;
+}
+
+function generateBuyerInfo(phone: string): { email: string; name: string } {
+  const formattedPhone = formatPhoneNumber(phone);
+  return {
+    email: `${formattedPhone}@inuka.pay`,
+    name: `User ${formattedPhone}`
+  };
+}
+
+async function createDepositOrder(orderId: string, phoneNumber: string, tzsAmount: number) {
+  try {
+    const formattedPhone = formatPhoneNumber(phoneNumber);
+    const buyerInfo = generateBuyerInfo(phoneNumber);
+
+    const response = await fetch(`${ZENO_API_URL}/mobile_money_tanzania`, {
+      method: 'POST',
+      headers: {
+        'x-api-key': ZENO_API_KEY!,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        order_id: orderId,
+        buyer_email: buyerInfo.email,
+        buyer_name: buyerInfo.name,
+        buyer_phone: formattedPhone,
+        amount: tzsAmount,
+        webhook_url: WEBHOOK_URL,
+      }),
+    });
+
+    const result = await response.json();
+    if (!response.ok || result.status !== 'success') {
+      return {
+        success: false,
+        error: result.message || 'Failed to create deposit order',
+      };
+    }
+    return { success: true, data: result };
+  } catch (error) {
+    console.error('Zeno deposit error:', error);
+    return { success: false, error: 'Failed to create deposit order' };
+  }
+}
+
+async function createWithdrawalOrder(orderId: string, phoneNumber: string, tzsAmount: number) {
+  try {
+    const formattedPhone = formatPhoneNumber(phoneNumber);
+    const buyerInfo = generateBuyerInfo(phoneNumber);
+
+    const response = await fetch(`${ZENO_API_URL}/mobile_money_tanzania`, {
+      method: 'POST',
+      headers: {
+        'x-api-key': ZENO_API_KEY!,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        order_id: orderId,
+        buyer_email: buyerInfo.email,
+        buyer_name: buyerInfo.name,
+        buyer_phone: formattedPhone,
+        amount: tzsAmount,
+        webhook_url: WEBHOOK_URL,
+      }),
+    });
+
+    const result = await response.json();
+    if (!response.ok || result.status !== 'success') {
+      return {
+        success: false,
+        error: result.message || 'Failed to create withdrawal order',
+      };
+    }
+    return { success: true, data: result };
+  } catch (error) {
+    console.error('Zeno withdrawal error:', error);
+    return { success: false, error: 'Failed to create withdrawal order' };
+  }
+}
+
+// ============================================================================
+// WHATSAPP MESSAGING
+// ============================================================================
+function addHomeButton(buttons: any[]): any[] {
+  if (buttons.length < 3) {
+    return [...buttons, { id: 'menu', title: '🏠 Home' }];
+  }
+  return buttons;
+}
+
+async function sendWhatsAppMessage(to: string, message: string) {
+  if (!META_ACCESS_TOKEN || !META_PHONE_NUMBER_ID) return null;
+  const enhancedMessage = message + '\n\n_Type *menu* to return home_';
+
+  try {
+    const response = await fetch(META_API_URL, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${META_ACCESS_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        messaging_product: 'whatsapp',
+        recipient_type: 'individual',
+        to: to,
+        type: 'text',
+        text: {
+          preview_url: false,
+          body: enhancedMessage,
+        },
+      }),
+    });
+    return await response.json();
+  } catch (error) {
+    console.error('Error sending WhatsApp message:', error);
+    throw error;
+  }
+}
+
+async function sendButtonMessage(to: string, bodyText: string, buttons: any[], footerText?: string) {
+  if (!META_ACCESS_TOKEN || !META_PHONE_NUMBER_ID) return null;
+  const buttonsWithHome = addHomeButton(buttons);
+
+  try {
+    const interactive: any = {
+      type: 'button',
+      body: { text: bodyText },
+      action: {
+        buttons: buttonsWithHome.slice(0, 3).map((btn: any, idx: number) => ({
+          type: 'reply',
+          reply: {
+            id: btn.id || `btn_${idx}`,
+            title: btn.title.substring(0, 20),
+          },
+        })),
+      },
+    };
+
+    if (footerText) {
+      interactive.footer = { text: footerText };
+    }
+
+    const response = await fetch(META_API_URL, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${META_ACCESS_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        messaging_product: 'whatsapp',
+        recipient_type: 'individual',
+        to: to,
+        type: 'interactive',
+        interactive,
+      }),
+    });
+    return await response.json();
+  } catch (error) {
+    console.error('Error sending button message:', error);
+    throw error;
+  }
+}
+
+async function sendListMessage(to: string, bodyText: string, buttonText: string, sections: any[]) {
+  if (!META_ACCESS_TOKEN || !META_PHONE_NUMBER_ID) return null;
+
+  try {
+    const response = await fetch(META_API_URL, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${META_ACCESS_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        messaging_product: 'whatsapp',
+        recipient_type: 'individual',
+        to: to,
+        type: 'interactive',
+        interactive: {
+          type: 'list',
+          body: { text: bodyText },
+          action: {
+            button: buttonText,
+            sections: sections,
+          },
+        },
+      }),
+    });
+    return await response.json();
+  } catch (error) {
+    console.error('Error sending list message:', error);
+    throw error;
+  }
+}
+
+// ============================================================================
+// NOTIFICATION SYSTEM
+// ============================================================================
+async function createNotification(userId: string, type: string, title: string, message: string, data: any = {}) {
+  await supabase.from('notifications').insert([{
+    user_id: userId,
+    notification_type: type,
+    title,
+    message,
+    data
+  }]);
+}
+
+async function notifyTransaction(recipientId: string, amount: string, token: string, fromUser: any) {
+  const user = await supabase.from('users').select('whatsapp_number').eq('id', recipientId).maybeSingle();
+
+  if (user.data) {
+    const tzsValue = token === 'ETH'
+      ? await convertCurrency(parseFloat(amount), 'ETH', 'TZS')
+      : parseFloat(amount);
+    const usdValue = await convertCurrency(tzsValue, 'TZS', 'USD');
+
+    const message = `💰 *Payment Received!*
+
+You received ${formatBalance(amount)} ${token}
+≈ ${formatTZS(tzsValue)} TZS
+≈ $${formatUSD(usdValue)} USD
+
+From: ${fromUser?.whatsapp_number || 'External'}
+Time: ${new Date().toLocaleString('en-US', { timeZone: 'Africa/Dar_es_Salaam' })}`;
+
+    await sendButtonMessage(
+      user.data.whatsapp_number,
+      message,
+      [
+        { id: 'balance', title: '💰 View Balance' },
+        { id: 'send', title: '📤 Send' },
+        { id: 'menu', title: '🏠 Home' }
+      ]
+    );
+    await createNotification(recipientId, 'transaction_received', 'Payment Received', message, {
+      amount, token, from: fromUser?.id
+    });
+  }
+}
+
+async function notifyChamaMembers(chamaId: string, title: string, message: string, excludeUserId?: string) {
+  const { data: members } = await supabase
+    .from('chama_members')
+    .select('user_id, users(whatsapp_number)')
+    .eq('chama_id', chamaId)
+    .eq('status', 'active');
+
+  if (members) {
+    for (const member of members) {
+      if (excludeUserId && member.user_id === excludeUserId) continue;
+      const user: any = member.users;
+      if (user?.whatsapp_number) {
+        await sendWhatsAppMessage(user.whatsapp_number, message);
+        await createNotification(member.user_id, 'chama_notification', title, message, { chamaId });
+      }
+    }
+  }
+}
+
+// ============================================================================
+// DATABASE OPERATIONS
+// ============================================================================
+async function getUserByWhatsApp(whatsappNumber: string) {
+  const { data, error } = await supabase.from('users').select('*').eq('whatsapp_number', whatsappNumber).maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
+async function getUserByPhone(phone: string) {
+  let normalizedPhone = phone.trim().replace(/[^\d+]/g, '');
+  const phoneFormats = [
+    normalizedPhone,
+    normalizedPhone.startsWith('0') ? '255' + normalizedPhone.substring(1) : normalizedPhone,
+    normalizedPhone.startsWith('255') ? normalizedPhone : '255' + normalizedPhone,
+    normalizedPhone.startsWith('+255') ? normalizedPhone.substring(1) : normalizedPhone,
+  ];
+
+  for (const format of phoneFormats) {
+    const user = await getUserByWhatsApp(format);
+    if (user) return user;
+  }
+  return null;
+}
+
+async function createUser(userData: any) {
+  const { data, error } = await supabase.from('users').insert([userData]).select().single();
+  if (error) throw error;
+  return data;
+}
+
+async function updateUser(userId: string, updates: any) {
+  const { data, error } = await supabase.from('users').update(updates).eq('id', userId).select().single();
+  if (error) throw error;
+  return data;
+}
+
+async function getActiveSession(userId: string) {
+  const { data, error } = await supabase
+    .from('message_sessions')
+    .select('*')
+    .eq('user_id', userId)
+    .gt('expires_at', new Date().toISOString())
+    .order('created_at', { ascending: false })
+    .maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
+async function createSession(sessionData: any) {
+  const expiresAt = new Date(Date.now() + SESSION_TIMEOUT_MS);
+  const { data, error } = await supabase
+    .from('message_sessions')
+    .insert([{ ...sessionData, expires_at: expiresAt.toISOString() }])
+    .select()
+    .single();
+  if (error) throw error;
+  return data;
+}
+
+async function updateSession(sessionId: string, updates: any) {
+  const expiresAt = new Date(Date.now() + SESSION_TIMEOUT_MS);
+  const { data, error } = await supabase
+    .from('message_sessions')
+    .update({ ...updates, expires_at: expiresAt.toISOString() })
+    .eq('id', sessionId)
+    .select()
+    .single();
+  if (error) throw error;
+  return data;
+}
+
+async function deleteSession(sessionId: string) {
+  const { error } = await supabase.from('message_sessions').delete().eq('id', sessionId);
+  if (error) throw error;
+}
+
+async function getUserPin(userId: string) {
+  const { data, error } = await supabase.from('user_pins').select('*').eq('user_id', userId).maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
+async function createUserPin(pinData: any) {
+  const { data, error } = await supabase.from('user_pins').insert([pinData]).select().single();
+  if (error) throw error;
+  return data;
+}
+
+async function updateUserPin(userId: string, updates: any) {
+  const { data, error } = await supabase.from('user_pins').update(updates).eq('user_id', userId).select().single();
+  if (error) throw error;
+  return data;
+}
+
+async function verifyPin(userId: string, pin: string) {
+  const pinData = await getUserPin(userId);
+  if (!pinData) return { success: false, error: 'PIN not set up' };
+
+  if (pinData.locked_until && new Date(pinData.locked_until) > new Date()) {
+    const remainingMinutes = Math.ceil((new Date(pinData.locked_until).getTime() - new Date().getTime()) / 60000);
+    return { success: false, error: `Account locked. Try again in ${remainingMinutes} minute(s)`, locked: true };
+  }
+
+  const hashedPin = hashPin(pin);
+  if (hashedPin === pinData.encrypted_pin) {
+    await updateUserPin(userId, { failed_attempts: 0, locked_until: null });
+    return { success: true };
+  } else {
+    const newFailedAttempts = pinData.failed_attempts + 1;
+    const updates: any = { failed_attempts: newFailedAttempts };
+    if (newFailedAttempts >= 3) {
+      updates.locked_until = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+    }
+    await updateUserPin(userId, updates);
+    const remainingAttempts = 3 - newFailedAttempts;
+    if (remainingAttempts <= 0) {
+      return { success: false, error: 'Too many failed attempts. Account locked for 5 minutes', locked: true };
+    }
+    return { success: false, error: `Incorrect PIN. ${remainingAttempts} attempt(s) remaining`, remainingAttempts };
+  }
+}
+
+async function createTransaction(txData: any) {
+  const { data, error } = await supabase.from('transactions').insert([txData]).select().single();
+  if (error) throw error;
+  return data;
+}
+
+async function getTransactionsByUser(userId: string, limit = 10) {
+  const { data, error } = await supabase
+    .from('transactions')
+    .select('*')
+    .or(`from_user_id.eq.${userId},to_user_id.eq.${userId}`)
+    .order('created_at', { ascending: false })
+    .limit(limit);
+  if (error) throw error;
+  return data;
+}
+
+async function createMobileMoneyTransaction(txData: any) {
+  const { data, error } = await supabase.from('mobile_money_transactions').insert([txData]).select().single();
+  if (error) throw error;
+  return data;
+}
+
+async function getUserChamas(userId: string) {
+  const { data, error } = await supabase
+    .from('chama_members')
+    .select('*, chamas(*)')
+    .eq('user_id', userId)
+    .eq('status', 'active');
+  if (error) throw error;
+  return data;
+}
+
+async function getChamaByInviteCode(inviteCode: string) {
+  const { data, error} = await supabase.from('chamas').select('*').eq('invite_code', inviteCode).maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
+async function getChamaById(chamaId: string) {
+  const { data, error } = await supabase.from('chamas').select('*').eq('id', chamaId).maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
+async function createChama(chamaData: any) {
+  const { data, error } = await supabase.from('chamas').insert([chamaData]).select().single();
+  if (error) throw error;
+  return data;
+}
+
+async function createChamaMember(memberData: any) {
+  const { data, error } = await supabase.from('chama_members').insert([memberData]).select().single();
+  if (error) throw error;
+  return data;
+}
+
+async function updateChama(chamaId: string, updates: any) {
+  const { data, error } = await supabase.from('chamas').update(updates).eq('id', chamaId).select().single();
+  if (error) throw error;
+  return data;
+}
+
+async function updateChamaMember(memberId: string, updates: any) {
+  const { data, error } = await supabase.from('chama_members').update(updates).eq('id', memberId).select().single();
+  if (error) throw error;
+  return data;
+}
+
+async function createChamaContribution(contributionData: any) {
+  const { data, error } = await supabase.from('chama_contributions').insert([contributionData]).select().single();
+  if (error) throw error;
+  return data;
+}
+
+async function getChamaMemberByUserAndChama(userId: string, chamaId: string) {
+  const { data, error } = await supabase
+    .from('chama_members')
+    .select('*')
+    .eq('user_id', userId)
+    .eq('chama_id', chamaId)
+    .maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
+async function getChamaLoans(chamaId: string | null, borrowerId: string | null) {
+  let query = supabase
+    .from('chama_loans')
+    .select('*, users(whatsapp_number), chamas(name)')
+    .order('created_at', { ascending: false });
+  if (chamaId) query = query.eq('chama_id', chamaId);
+  if (borrowerId) query = query.eq('borrower_id', borrowerId);
+  const { data, error } = await query;
+  if (error) throw error;
+  return data;
+}
+
+async function createLoan(loanData: any) {
+  const { data, error } = await supabase.from('chama_loans').insert([loanData]).select().single();
+  if (error) throw error;
+  return data;
+}
+
+async function updateLoan(loanId: string, updates: any) {
+  const { data, error } = await supabase.from('chama_loans').update(updates).eq('id', loanId).select().single();
+  if (error) throw error;
+  return data;
+}
+
+async function callDatabaseFunction(functionName: string, params: any) {
+  const { data, error } = await supabase.rpc(functionName, params);
+  if (error) throw error;
+  return data;
+}
+
+// ============================================================================
+// COMMAND HANDLERS
+// ============================================================================
+async function handleNewUser(from: string) {
+  try {
+    const wallet = createWallet();
+    const userData = {
+      whatsapp_number: from,
+      wallet_address: wallet.address,
+      encrypted_private_key: encrypt(wallet.privateKey),
+      encrypted_mnemonic: encrypt(wallet.mnemonic),
+      is_onboarded: false,
+      pin_setup_completed: false,
+      eth_balance: 0,
+      tzs_balance: 0,
+    };
+    const user = await createUser(userData);
+
+    const welcomeMessage = `🎉 *Welcome to ${APP_NAME}!*
+${APP_DESCRIPTION}
+
+Your wallet has been created!
+
+📍 *Your Address:*
+\`${wallet.address}\`
+
+⚠️ *SAVE YOUR RECOVERY PHRASE:*
+\`${wallet.mnemonic}\`
+
+• Write it down and store safely
+• NEVER share with anyone
+• You'll need it to recover your wallet`;
+
+    await sendWhatsAppMessage(from, welcomeMessage);
+
+    await createSession({
+      user_id: user.id,
+      session_type: 'setup_pin',
+      current_step: 'ask_pin',
+      session_data: {},
+    });
+
+    await sendWhatsAppMessage(from, '🔐 *Security Setup*\n\nCreate a 4-6 digit PIN:\n\nEnter your PIN:');
+  } catch (error) {
+    console.error('Error creating user:', error);
+    await sendWhatsAppMessage(from, '❌ Error creating wallet. Try again.');
+  }
+}
+
+async function handleBalanceCommand(user: any) {
+  try {
+    const balances = await getAllBalances(user.wallet_address);
+    const rates = await fetchRealTimeFXRates();
+
+    const ethInTzs = await convertCurrency(parseFloat(balances.eth), 'ETH', 'TZS');
+    const ethInUsd = await convertCurrency(parseFloat(balances.eth), 'ETH', 'USD');
+    const tzsValue = parseFloat(balances.tzs);
+    const tzsInUsd = await convertCurrency(tzsValue, 'TZS', 'USD');
+    const totalTzs = ethInTzs + tzsValue;
+    const totalUsd = ethInUsd + tzsInUsd;
+
+    const message = `💰 *Your Balance*
+
+*ETH:* ${formatBalance(balances.eth)}
+  ≈ ${formatTZS(ethInTzs)} TZS
+  ≈ $${formatUSD(ethInUsd)} USD
+
+*TZS:* ${formatBalance(balances.tzs)}
+  ≈ $${formatUSD(tzsInUsd)} USD
+
+*Total Value:*
+  ${formatTZS(totalTzs)} TZS
+  $${formatUSD(totalUsd)} USD
+
+📍 *Address:* \`${user.wallet_address}\`
+Network: Scroll Sepolia`;
+
+    await sendButtonMessage(
+      user.whatsapp_number,
+      message,
+      [
+        { id: 'send', title: '📤 Send' },
+        { id: 'deposit', title: '💳 Deposit' },
+        { id: 'chama', title: '👥 Save in Chama' }
+      ],
+      'What would you like to do?'
+    );
+  } catch (error) {
+    console.error('Error checking balance:', error);
+    await sendWhatsAppMessage(user.whatsapp_number, '❌ Error checking balance.');
+  }
+}
+
+async function showMainMenu(user: any) {
+  const message = `${APP_NAME}
+${APP_DESCRIPTION}
+
+What would you like to do?`;
+
+  await sendButtonMessage(
+    user.whatsapp_number,
+    message,
+    [
+      { id: 'wallet_menu', title: '💰 Wallet' },
+      { id: 'money_savings', title: '💳 Money & Savings' },
+      { id: 'settings_menu', title: '⚙️ Settings' }
+    ],
+    'Select an option above'
+  );
+}
+
+async function showWalletMenu(user: any) {
+  await sendButtonMessage(
+    user.whatsapp_number,
+    '💰 *Wallet Menu*\n\nManage your crypto wallet:',
+    [
+      { id: 'balance', title: '💰 Balance' },
+      { id: 'send', title: '📤 Send' },
+      { id: 'receive', title: '📥 Receive' }
+    ],
+    'Type *menu* for home'
+  );
+}
+
+async function showMoneySavingsMenu(user: any) {
+  await sendButtonMessage(
+    user.whatsapp_number,
+    '💳 *Money & Savings*\n\nMobile money and group savings:',
+    [
+      { id: 'mobile_money', title: '💳 Mobile Money' },
+      { id: 'chama', title: '👥 Chama' },
+      { id: 'loans', title: '💵 Loans' }
+    ],
+    'Type *menu* for home'
+  );
+}
+
+async function showMobileMoneyMenu(user: any) {
+  await sendButtonMessage(
+    user.whatsapp_number,
+    '💳 *Mobile Money*\n\nM-Pesa transactions:',
+    [
+      { id: 'deposit', title: '💳 Deposit' },
+      { id: 'withdraw', title: '💸 Withdraw' },
+      { id: 'menu', title: '🏠 Home' }
+    ],
+    'Deposit or withdraw with M-Pesa'
+  );
+}
+
+async function showSettingsMenu(user: any) {
+  await sendButtonMessage(
+    user.whatsapp_number,
+    '⚙️ *Settings*\n\nAccount management:',
+    [
+      { id: 'history', title: '📊 History' },
+      { id: 'recover', title: '🔑 Recovery' },
+      { id: 'menu', title: '🏠 Home' }
+    ],
+    'Manage your account'
+  );
+}
+
+async function handleSendCommand(user: any) {
+  try {
+    await createSession({
+      user_id: user.id,
+      session_type: 'send_crypto',
+      current_step: 'ask_token',
+      session_data: {},
+    });
+
+    await sendButtonMessage(
+      user.whatsapp_number,
+      '📤 *Send Crypto*\n\nSelect token:',
+      [
+        { id: 'send_eth', title: 'ETH' },
+        { id: 'send_tzs', title: 'TZS' },
+      ]
+    );
+  } catch (error) {
+    console.error('Error starting send:', error);
+    await sendWhatsAppMessage(user.whatsapp_number, '❌ Error starting send.');
+  }
+}
+
+async function handleReceiveCommand(user: any) {
+  try {
+    const message = `📥 *Receive Crypto*
+
+Share this address:
+\`${user.wallet_address}\`
+
+Network: Scroll Sepolia Testnet
+
+*Supported:*
+• ETH (Native)
+• TZS (ERC20)
+
+Anyone can send to this address!`;
+
+    await sendButtonMessage(
+      user.whatsapp_number,
+      message,
+      [
+        { id: 'balance', title: '💰 Balance' },
+        { id: 'send', title: '📤 Send' },
+        { id: 'menu', title: '🏠 Home' }
+      ],
+      'What would you like to do?'
+    );
+  } catch (error) {
+    console.error('Error in receive:', error);
+    await sendWhatsAppMessage(user.whatsapp_number, '❌ Error.');
+  }
+}
+
+async function handleHistoryCommand(user: any) {
+  try {
+    const transactions = await getTransactionsByUser(user.id, 10);
+    if (transactions.length === 0) {
+      await sendButtonMessage(
+        user.whatsapp_number,
+        '📊 *Transaction History*\n\nNo transactions yet.\n\nStart by depositing or receiving crypto!',
+        [
+          { id: 'deposit', title: '💳 Deposit' },
+          { id: 'receive', title: '📥 Receive' },
+          { id: 'menu', title: '🏠 Home' }
+        ]
+      );
+      return;
+    }
+
+    let message = '📊 *Transaction History*\n\nLast 10 transactions:\n\n';
+
+    for (const tx of transactions.slice(0, 5)) {
+      const type = tx.from_user_id === user.id ? 'Sent' : 'Received';
+      const emoji = type === 'Sent' ? '📤' : '📥';
+      const address = type === 'Sent' ?
+        `To: ${tx.to_address.slice(0, 8)}...${tx.to_address.slice(-6)}` :
+        `From: ${tx.from_user_id ? 'User' : 'External'}`;
+
+      const tzsValue = tx.token_symbol === 'ETH'
+        ? await convertCurrency(parseFloat(tx.amount), 'ETH', 'TZS')
+        : parseFloat(tx.amount);
+      const usdValue = await convertCurrency(tzsValue, 'TZS', 'USD');
+
+      message += `${emoji} ${type} ${tx.token_symbol}\n`;
+      message += ` ${formatBalance(tx.amount)} ${tx.token_symbol}\n`;
+      message += ` ≈ ${formatTZS(tzsValue)} TZS ≈ $${formatUSD(usdValue)}\n`;
+      message += ` ${address}\n`;
+      message += ` ${new Date(tx.created_at).toLocaleDateString()}\n\n`;
+    }
+
+    await sendButtonMessage(
+      user.whatsapp_number,
+      message.trim(),
+      [
+        { id: 'send', title: '📤 Send' },
+        { id: 'balance', title: '💰 Balance' },
+        { id: 'menu', title: '🏠 Home' }
+      ],
+      'View more in full history'
+    );
+  } catch (error) {
+    console.error('Error fetching history:', error);
+    await sendWhatsAppMessage(user.whatsapp_number, '❌ Error fetching history.');
+  }
+}
+
+async function handleRecoveryCommand(user: any) {
+  try {
+    await createSession({
+      user_id: user.id,
+      session_type: 'recovery',
+      current_step: 'verify_pin',
+      session_data: {},
+    });
+    await sendWhatsAppMessage(user.whatsapp_number, '🔐 *Wallet Recovery*\n\nEnter your PIN:');
+  } catch (error) {
+    console.error('Error starting recovery:', error);
+    await sendWhatsAppMessage(user.whatsapp_number, '❌ Error.');
+  }
+}
+
+async function handleCommand(user: any, command: string) {
+  if (!user.pin_setup_completed) {
+    await sendWhatsAppMessage(user.whatsapp_number, '🔐 Complete PIN setup first. Reply with a 4-6 digit PIN.');
+    await createSession({
+      user_id: user.id,
+      session_type: 'setup_pin',
+      current_step: 'ask_pin',
+      session_data: {},
+    });
+    return;
+  }
+
+  const commands: Record<string, (user: any) => Promise<void>> = {
+    'balance': handleBalanceCommand,
+    'bal': handleBalanceCommand,
+    'menu': showMainMenu,
+    'home': showMainMenu,
+    'start': showMainMenu,
+    'help': showMainMenu,
+    'wallet_menu': showWalletMenu,
+    'money_savings': showMoneySavingsMenu,
+    'mobile_money': showMobileMoneyMenu,
+    'settings_menu': showSettingsMenu,
+    'send': handleSendCommand,
+    'receive': handleReceiveCommand,
+    'history': handleHistoryCommand,
+    'recover': handleRecoveryCommand,
+  };
+
+  if (command === 'deposit') {
+    await createSession({
+      user_id: user.id,
+      session_type: 'mobile_money_deposit',
+      current_step: 'ask_token',
+      session_data: {},
+    });
+    await sendButtonMessage(user.whatsapp_number, '💳 *Deposit via M-Pesa*\n\nSelect token:', [
+      { id: 'deposit_eth', title: 'ETH' },
+      { id: 'deposit_tzs', title: 'TZS' },
+    ]);
+    return;
+  }
+
+  if (command === 'withdraw') {
+    await createSession({
+      user_id: user.id,
+      session_type: 'mobile_money_withdraw',
+      current_step: 'ask_token',
+      session_data: {},
+    });
+    await sendButtonMessage(user.whatsapp_number, '💸 *Withdraw to M-Pesa*\n\nSelect token:', [
+      { id: 'withdraw_eth', title: 'ETH' },
+      { id: 'withdraw_tzs', title: 'TZS' },
+    ]);
+    return;
+  }
+
+  if (command === 'chama') {
+    await sendButtonMessage(
+      user.whatsapp_number,
+      '👥 *Chama - Group Savings*\n\nJoin or create a chama:',
+      [
+        { id: 'chama_create', title: '➕ Create' },
+        { id: 'chama_join', title: '🔗 Join' },
+        { id: 'chama_my', title: '📋 My Chamas' }
+      ],
+      'Type *menu* for home'
+    );
+    return;
+  }
+
+  if (command === 'chama_my') {
+    const chamas = await getUserChamas(user.id);
+    if (chamas.length === 0) {
+      await sendButtonMessage(
+        user.whatsapp_number,
+        '👥 *My Chamas*\n\nNot a member yet.\n\nCreate or join a chama to start saving together!',
+        [
+          { id: 'chama_create', title: '➕ Create' },
+          { id: 'chama_join', title: '🔗 Join' },
+          { id: 'menu', title: '🏠 Home' }
+        ]
+      );
+      return;
+    }
+
+    let message = '👥 *My Chamas*\n\n';
+    for (const membership of chamas) {
+      const chama = membership.chamas;
+      const tzsValue = parseFloat(membership.tzs_share || 0);
+      const usdValue = await convertCurrency(tzsValue, 'TZS', 'USD');
+
+      message += `*${chama.name}*\n`;
+      message += ` Your share: ${formatBalance(membership.tzs_share || 0)} TZS\n`;
+      message += ` ≈ $${formatUSD(usdValue)} USD\n`;
+      message += ` Code: ${chama.invite_code}\n\n`;
+    }
+
+    await sendButtonMessage(
+      user.whatsapp_number,
+      message.trim(),
+      [
+        { id: 'chama_contribute', title: '💰 Contribute' },
+        { id: 'loan_request', title: '💵 Request Loan' },
+        { id: 'chama', title: '👥 Chama Menu' }
+      ],
+      'Manage your chamas'
+    );
+    return;
+  }
+
+  if (command === 'chama_create') {
+    await createSession({
+      user_id: user.id,
+      session_type: 'chama_create',
+      current_step: 'ask_name',
+      session_data: {},
+    });
+    await sendWhatsAppMessage(user.whatsapp_number, '➕ *Create Chama*\n\nEnter Chama name:');
+    return;
+  }
+
+  if (command === 'chama_join') {
+    await createSession({
+      user_id: user.id,
+      session_type: 'chama_join',
+      current_step: 'ask_code',
+      session_data: {},
+    });
+    await sendWhatsAppMessage(user.whatsapp_number, '🔗 *Join Chama*\n\nEnter invite code:');
+    return;
+  }
+
+  if (command === 'chama_contribute') {
+    const chamas = await getUserChamas(user.id);
+    if (chamas.length === 0) {
+      await sendWhatsAppMessage(user.whatsapp_number, '💰 *Contribute*\n\nJoin a Chama first.\n\nType *chama* to start.');
+      return;
+    }
+
+    await createSession({
+      user_id: user.id,
+      session_type: 'chama_contribute',
+      current_step: 'select_chama',
+      session_data: { chamas },
+    });
+
+    const sections = [{
+      title: 'Your Chamas',
+      rows: chamas.map((m: any) => ({
+        id: `chama_${m.chama_id}`,
+        title: m.chamas.name,
+        description: `Code: ${m.chamas.invite_code}`,
+      })),
+    }];
+
+    await sendListMessage(user.whatsapp_number, '💰 *Contribute*\n\nSelect Chama:', 'Select', sections);
+    return;
+  }
+
+  if (command === 'loans') {
+    await sendButtonMessage(
+      user.whatsapp_number,
+      '💵 *Loans*\n\nBorrow from your chama:',
+      [
+        { id: 'loan_request', title: '💰 Request Loan' },
+        { id: 'loan_my', title: '📋 My Loans' },
+        { id: 'loan_pending', title: '⏳ Pending' }
+      ],
+      'Type *menu* for home'
+    );
+    return;
+  }
+
+  if (command === 'loan_my') {
+    const loans = await getChamaLoans(null, user.id);
+    if (loans.length === 0) {
+      await sendButtonMessage(
+        user.whatsapp_number,
+        '📋 *My Loans*\n\nNo loans yet.\n\nRequest a loan from your chama to get started!',
+        [
+          { id: 'loan_request', title: '💰 Request Loan' },
+          { id: 'chama_my', title: '👥 My Chamas' },
+          { id: 'menu', title: '🏠 Home' }
+        ]
+      );
+      return;
+    }
+
+    let message = '📋 *My Loans*\n\n';
+    for (const loan of loans) {
+      const tzsValue = parseFloat(loan.outstanding_balance);
+      const usdValue = await convertCurrency(tzsValue, 'TZS', 'USD');
+
+      message += `*${loan.chamas.name}*\n`;
+      message += ` Outstanding: ${formatBalance(loan.outstanding_balance)} TZS\n`;
+      message += ` ≈ $${formatUSD(usdValue)} USD\n`;
+      message += ` Interest: ${loan.interest_rate}%\n`;
+      message += ` Status: ${loan.status}\n\n`;
+    }
+    await sendWhatsAppMessage(user.whatsapp_number, message.trim());
+    return;
+  }
+
+  if (command === 'loan_request') {
+    const chamas = await getUserChamas(user.id);
+    if (chamas.length === 0) {
+      await sendWhatsAppMessage(user.whatsapp_number, '📝 *Request Loan*\n\nJoin a Chama first.\n\nType *chama*.');
+      return;
+    }
+
+    await createSession({
+      user_id: user.id,
+      session_type: 'loan_request',
+      current_step: 'select_chama',
+      session_data: { chamas },
+    });
+
+    const sections = [{
+      title: 'Your Chamas',
+      rows: chamas.map((m: any) => ({
+        id: `loan_chama_${m.chama_id}`,
+        title: m.chamas.name,
+        description: `Available funds`,
+      })),
+    }];
+
+    await sendListMessage(user.whatsapp_number, '📝 *Request Loan*\n\nSelect Chama:', 'Select', sections);
+    return;
+  }
+
+  if (command === 'loan_pay') {
+    const loans = await getChamaLoans(null, user.id);
+    const activeLoans = loans.filter((loan: any) => loan.status === 'active');
+
+    if (activeLoans.length === 0) {
+      await sendWhatsAppMessage(user.whatsapp_number, '💳 *Pay Loan*\n\nNo active loans.');
+      return;
+    }
+
+    await createSession({
+      user_id: user.id,
+      session_type: 'loan_pay',
+      current_step: 'select_loan',
+      session_data: { loans: activeLoans },
+    });
+
+    const sections = [{
+      title: 'Active Loans',
+      rows: activeLoans.map((loan: any, idx: number) => ({
+        id: `pay_loan_${idx}`,
+        title: `${loan.chamas.name}`,
+        description: `Balance: ${formatBalance(loan.outstanding_balance)} TZS`,
+      })),
+    }];
+
+    await sendListMessage(user.whatsapp_number, '💳 *Pay Loan*\n\nSelect loan:', 'Select', sections);
+    return;
+  }
+
+  const handler = commands[command];
+  if (handler) {
+    await handler(user);
+  } else {
+    await showMainMenu(user);
+  }
+}
+
+// ============================================================================
+// SESSION HANDLERS
+// ============================================================================
+async function handlePinSetupSession(user: any, session: any, messageText: string) {
+  const currentStep = session.current_step;
+  const sessionData = session.session_data || {};
+
+  try {
+    if (currentStep === 'ask_pin') {
+      const pin = messageText.trim();
+      if (!isValidPinFormat(pin)) {
+        await sendWhatsAppMessage(user.whatsapp_number, '❌ Invalid PIN. Enter 4-6 digits:');
+        return;
+      }
+      sessionData.pin = pin;
+      await updateSession(session.id, {
+        session_data: sessionData,
+        current_step: 'confirm_pin',
+      });
+      await sendWhatsAppMessage(user.whatsapp_number, '🔐 Confirm your PIN:');
+    } else if (currentStep === 'confirm_pin') {
+      const confirmPin = messageText.trim();
+      if (confirmPin !== sessionData.pin) {
+        await sendWhatsAppMessage(user.whatsapp_number, '❌ PINs do not match. Enter new PIN (4-6 digits):');
+        await updateSession(session.id, {
+          session_data: {},
+          current_step: 'ask_pin',
+        });
+        return;
+      }
+
+      const hashedPin = hashPin(sessionData.pin);
+      await createUserPin({
+        user_id: user.id,
+        encrypted_pin: hashedPin,
+        failed_attempts: 0,
+      });
+
+      await updateUser(user.id, { pin_setup_completed: true, is_onboarded: true });
+      await sendWhatsAppMessage(user.whatsapp_number, '✅ *PIN created!*\n\nWallet is ready.\n\nType *menu* to start!');
+      await deleteSession(session.id);
+    }
+  } catch (error) {
+    console.error('Error in PIN setup:', error);
+    await sendWhatsAppMessage(user.whatsapp_number, '❌ Error setting up PIN.');
+    await deleteSession(session.id);
+  }
+}
+
+async function handleSendCryptoSession(user: any, session: any, messageText: string) {
+  const currentStep = session.current_step;
+  const sessionData = session.session_data || {};
+
+  try {
+    if (currentStep === 'ask_token') {
+      if (messageText === 'send_eth') {
+        sessionData.tokenSymbol = 'ETH';
+      } else if (messageText === 'send_tzs') {
+        sessionData.tokenSymbol = 'TZS';
+      } else {
+        await sendWhatsAppMessage(user.whatsapp_number, 'Select ETH or TZS');
+        return;
+      }
+
+      const balances = await getAllBalances(user.wallet_address);
+      const balance = sessionData.tokenSymbol === 'ETH' ? balances.eth : balances.tzs;
+
+      await updateSession(session.id, {
+        session_data: sessionData,
+        current_step: 'ask_recipient',
+      });
+
+      await sendWhatsAppMessage(
+        user.whatsapp_number,
+        `📤 *Send ${sessionData.tokenSymbol}*\n\nBalance: ${formatBalance(balance)} ${sessionData.tokenSymbol}\n\nEnter recipient (address or phone):` );
+    } else if (currentStep === 'ask_recipient') {
+      const input = messageText.trim();
+      let recipientAddress = '';
+      let recipientUser = null;
+
+      if (/^\d+$/.test(input)) {
+        recipientUser = await getUserByPhone(input);
+        if (recipientUser) {
+          recipientAddress = recipientUser.wallet_address;
+          sessionData.recipientUserId = recipientUser.id;
+          sessionData.recipientPhone = input;
+        } else {
+          await sendWhatsAppMessage(user.whatsapp_number, '❌ No wallet for this number.');
+          await deleteSession(session.id);
+          return;
+        }
+      } else if (isValidAddress(input)) {
+        recipientAddress = input;
+      } else {
+        await sendWhatsAppMessage(user.whatsapp_number, '❌ Invalid address or phone.');
+        return;
+      }
+
+      sessionData.toAddress = recipientAddress;
+
+      await updateSession(session.id, {
+        session_data: sessionData,
+        current_step: 'ask_amount',
+      });
+
+      await sendWhatsAppMessage(user.whatsapp_number, `💰 Enter amount of ${sessionData.tokenSymbol}:\n\nExample: 0.01`);
+    } else if (currentStep === 'ask_amount') {
+      const amount = parseFloat(messageText.trim());
+      if (isNaN(amount) || amount <= 0) {
+        await sendWhatsAppMessage(user.whatsapp_number, '❌ Invalid amount.');
+        return;
+      }
+
+      const balances = await getAllBalances(user.wallet_address);
+      const balance = sessionData.tokenSymbol === 'ETH' ? parseFloat(balances.eth) : parseFloat(balances.tzs);
+
+      if (amount > balance) {
+        await sendWhatsAppMessage(user.whatsapp_number, `❌ Insufficient: ${formatBalance(balance)} ${sessionData.tokenSymbol}`);
+        await deleteSession(session.id);
+        return;
+      }
+
+      sessionData.amount = amount.toString();
+
+      await updateSession(session.id, {
+        session_data: sessionData,
+        current_step: 'confirm',
+      });
+
+      const tzsValue = sessionData.tokenSymbol === 'ETH'
+        ? await convertCurrency(amount, 'ETH', 'TZS')
+        : amount;
+      const usdValue = await convertCurrency(tzsValue, 'TZS', 'USD');
+
+      const confirmMessage = `📤 *Confirm*
+
+To: \`${sessionData.toAddress.slice(0, 10)}...${sessionData.toAddress.slice(-8)}\`
+${sessionData.recipientPhone ? `Phone: ${sessionData.recipientPhone}\n` : ''}
+Amount: ${formatBalance(amount)} ${sessionData.tokenSymbol}
+≈ ${formatTZS(tzsValue)} TZS
+≈ $${formatUSD(usdValue)} USD`;
+
+      await sendButtonMessage(user.whatsapp_number, confirmMessage, [
+        { id: 'confirm_yes', title: '✅ Confirm' },
+        { id: 'confirm_no', title: '❌ Cancel' },
+      ]);
+    } else if (currentStep === 'confirm') {
+      if (messageText === 'confirm_yes') {
+        await updateSession(session.id, {
+          session_data: sessionData,
+          current_step: 'verify_pin',
+        });
+        await sendWhatsAppMessage(user.whatsapp_number, '🔐 Enter PIN:');
+      } else {
+        await sendWhatsAppMessage(user.whatsapp_number, '❌ Cancelled.');
+        await deleteSession(session.id);
+      }
+    } else if (currentStep === 'verify_pin') {
+      const pin = messageText.trim();
+      const verifyResult = await verifyPin(user.id, pin);
+
+      if (!verifyResult.success) {
+        await sendWhatsAppMessage(user.whatsapp_number, `❌ ${verifyResult.error}`);
+        if (verifyResult.locked) {
+          await deleteSession(session.id);
+        }
+        return;
+      }
+
+      await sendWhatsAppMessage(user.whatsapp_number, '⏳ Processing...');
+
+      try {
+        const tx = await sendToken(
+          user.encrypted_private_key,
+          sessionData.toAddress,
+          sessionData.amount,
+          sessionData.tokenSymbol
+        );
+
+        const txData = {
+          tx_hash: tx.hash,
+          from_user_id: user.id,
+          to_user_id: sessionData.recipientUserId || null,
+          to_address: sessionData.toAddress,
+          amount: sessionData.amount,
+          token_symbol: sessionData.tokenSymbol,
+          status: 'pending',
+          network: NETWORK,
+        };
+
+        await createTransaction(txData);
+        balanceCache.delete(user.wallet_address);
+
+        const tzsValue = sessionData.tokenSymbol === 'ETH'
+          ? await convertCurrency(parseFloat(sessionData.amount), 'ETH', 'TZS')
+          : parseFloat(sessionData.amount);
+        const usdValue = await convertCurrency(tzsValue, 'TZS', 'USD');
+
+        const txMessage = `✅ *Transaction Successful!*
+
+Amount: ${formatBalance(sessionData.amount)} ${sessionData.tokenSymbol}
+≈ ${formatTZS(tzsValue)} TZS
+≈ $${formatUSD(usdValue)} USD
+
+Tx: ${tx.hash.slice(0, 10)}...${tx.hash.slice(-8)}
+View: ${SCROLL_SEPOLIA_EXPLORER}/tx/${tx.hash}`;
+
+        await sendButtonMessage(
+          user.whatsapp_number,
+          txMessage,
+          [
+            { id: 'balance', title: '💰 Balance' },
+            { id: 'send', title: '📤 Send Again' },
+            { id: 'menu', title: '🏠 Home' }
+          ],
+          'What\'s next?'
+        );
+
+        if (sessionData.recipientUserId) {
+          await notifyTransaction(sessionData.recipientUserId, sessionData.amount, sessionData.tokenSymbol, user);
+          balanceCache.delete(sessionData.toAddress);
+        }
+
+        try {
+          const receipt = await tx.wait(1);
+          if (receipt && receipt.status === 1) {
+            await sendWhatsAppMessage(user.whatsapp_number, '✅ Confirmed on blockchain!');
+          }
+        } catch (waitError) {
+          console.error('Confirmation wait error:', waitError);
+        }
+
+        await deleteSession(session.id);
+      } catch (txError: any) {
+        console.error('Transaction error:', txError);
+        await sendWhatsAppMessage(user.whatsapp_number, '❌ Transaction failed.');
+        await deleteSession(session.id);
+      }
+    }
+  } catch (error) {
+    console.error('Error in send session:', error);
+    await sendWhatsAppMessage(user.whatsapp_number, '❌ Error.');
+    await deleteSession(session.id);
+  }
+}
+
+async function handleMobileMoneyDepositSession(user: any, session: any, messageText: string) {
+  const currentStep = session.current_step;
+  const sessionData = session.session_data || {};
+
+  try {
+    if (currentStep === 'ask_token') {
+      if (messageText === 'deposit_eth') {
+        sessionData.tokenSymbol = 'ETH';
+      } else if (messageText === 'deposit_tzs') {
+        sessionData.tokenSymbol = 'TZS';
+      } else {
+        await sendWhatsAppMessage(user.whatsapp_number, 'Select ETH or TZS');
+        return;
+      }
+
+      await updateSession(session.id, {
+        session_data: sessionData,
+        current_step: 'ask_amount',
+      });
+
+      const rates = await fetchRealTimeFXRates();
+      const minTzs = 1000;
+
+      await sendWhatsAppMessage(
+        user.whatsapp_number,
+        `💳 *Deposit via M-Pesa*\n\nEnter TZS amount (min ${formatTZS(minTzs)}):\n\nRate: 1 ETH = ${formatTZS(rates.ETH_TZS)} TZS`
+      );
+    } else if (currentStep === 'ask_amount') {
+      const tzsAmount = parseInt(messageText.trim());
+
+      if (isNaN(tzsAmount) || tzsAmount < 1000) {
+        await sendWhatsAppMessage(user.whatsapp_number, '❌ Minimum 1,000 TZS.');
+        return;
+      }
+
+      sessionData.tzsAmount = tzsAmount;
+
+      await updateSession(session.id, {
+        session_data: sessionData,
+        current_step: 'ask_phone',
+      });
+
+      await sendWhatsAppMessage(user.whatsapp_number, '📱 Enter M-Pesa phone:\n\nExample: 255712345678');
+    } else if (currentStep === 'ask_phone') {
+      const phoneNumber = messageText.trim();
+
+      if (!/^255\d{9}$/.test(phoneNumber)) {
+        await sendWhatsAppMessage(user.whatsapp_number, '❌ Invalid: 255XXXXXXXXX');
+        return;
+      }
+
+      sessionData.phoneNumber = phoneNumber;
+
+      await updateSession(session.id, {
+        session_data: sessionData,
+        current_step: 'confirm',
+      });
+
+      const cryptoAmount = sessionData.tokenSymbol === 'ETH'
+        ? await convertCurrency(sessionData.tzsAmount, 'TZS', 'ETH')
+        : sessionData.tzsAmount;
+      const usdValue = await convertCurrency(sessionData.tzsAmount, 'TZS', 'USD');
+
+      sessionData.cryptoAmount = cryptoAmount;
+
+      const confirmMessage = `💳 *Confirm Deposit*
+
+Amount: ${formatTZS(sessionData.tzsAmount)} TZS
+≈ $${formatUSD(usdValue)} USD
+
+You'll receive:
+${formatBalance(cryptoAmount)} ${sessionData.tokenSymbol}
+
+Phone: ${phoneNumber}`;
+
+      await sendButtonMessage(user.whatsapp_number, confirmMessage, [
+        { id: 'confirm_yes', title: '✅ Confirm' },
+        { id: 'confirm_no', title: '❌ Cancel' },
+      ]);
+    } else if (currentStep === 'confirm') {
+      if (messageText === 'confirm_yes') {
+        await sendWhatsAppMessage(user.whatsapp_number, '⏳ Processing...');
+
+        const orderId = generateOrderId(user.id);
+
+        const txData = {
+          user_id: user.id,
+          order_id: orderId,
+          transaction_type: 'deposit',
+          token_symbol: sessionData.tokenSymbol,
+          amount_tzs: sessionData.tzsAmount,
+          amount_crypto: sessionData.cryptoAmount,
+          phone_number: sessionData.phoneNumber,
+          payment_channel: 'MPESA-TZ',
+          status: 'pending',
+        };
+
+        await createMobileMoneyTransaction(txData);
+
+        const zenoResult = await createDepositOrder(
+          orderId,
+          sessionData.phoneNumber,
+          sessionData.tzsAmount
+        );
+
+        if (zenoResult.success) {
+          await sendWhatsAppMessage(
+            user.whatsapp_number,
+            `✅ *Deposit Initiated!*\n\nYou'll receive ${formatBalance(sessionData.cryptoAmount)} ${sessionData.tokenSymbol}\n\nComplete M-Pesa prompt.`
+          );
+        } else {
+          await sendWhatsAppMessage(user.whatsapp_number, `❌ Failed: ${zenoResult.error}`);
+        }
+
+        await deleteSession(session.id);
+      } else {
+        await sendWhatsAppMessage(user.whatsapp_number, '❌ Cancelled.');
+        await deleteSession(session.id);
+      }
+    }
+  } catch (error) {
+    console.error('Error in deposit session:', error);
+    await sendWhatsAppMessage(user.whatsapp_number, '❌ Error.');
+    await deleteSession(session.id);
+  }
+}
+
+async function handleMobileMoneyWithdrawSession(user: any, session: any, messageText: string) {
+  const currentStep = session.current_step;
+  const sessionData = session.session_data || {};
+
+  try {
+    if (currentStep === 'ask_token') {
+      if (messageText === 'withdraw_eth') {
+        sessionData.tokenSymbol = 'ETH';
+      } else if (messageText === 'withdraw_tzs') {
+        sessionData.tokenSymbol = 'TZS';
+      } else {
+        await sendWhatsAppMessage(user.whatsapp_number, 'Select ETH or TZS');
+        return;
+      }
+
+      await updateSession(session.id, {
+        session_data: sessionData,
+        current_step: 'ask_amount',
+      });
+
+      const balances = await getAllBalances(user.wallet_address);
+      const balance = sessionData.tokenSymbol === 'ETH' ? balances.eth : balances.tzs;
+
+      await sendWhatsAppMessage(
+        user.whatsapp_number,
+        `💸 *Withdraw to M-Pesa*\n\nBalance: ${formatBalance(balance)} ${sessionData.tokenSymbol}\n\nEnter amount:`
+      );
+    } else if (currentStep === 'ask_amount') {
+      const cryptoAmount = parseFloat(messageText.trim());
+
+      if (isNaN(cryptoAmount) || cryptoAmount <= 0) {
+        await sendWhatsAppMessage(user.whatsapp_number, '❌ Invalid amount.');
+        return;
+      }
+
+      const balances = await getAllBalances(user.wallet_address);
+      const balance = sessionData.tokenSymbol === 'ETH' ? parseFloat(balances.eth) : parseFloat(balances.tzs);
+
+      if (cryptoAmount > balance) {
+        await sendWhatsAppMessage(user.whatsapp_number, `❌ Insufficient: ${formatBalance(balance)} ${sessionData.tokenSymbol}`);
+        await deleteSession(session.id);
+        return;
+      }
+
+      sessionData.cryptoAmount = cryptoAmount;
+
+      await updateSession(session.id, {
+        session_data: sessionData,
+        current_step: 'ask_phone',
+      });
+
+      await sendWhatsAppMessage(user.whatsapp_number, '📱 Enter M-Pesa phone:\n\nExample: 255712345678');
+    } else if (currentStep === 'ask_phone') {
+      const phoneNumber = messageText.trim();
+
+      if (!/^255\d{9}$/.test(phoneNumber)) {
+        await sendWhatsAppMessage(user.whatsapp_number, '❌ Invalid: 255XXXXXXXXX');
+        return;
+      }
+
+      sessionData.phoneNumber = phoneNumber;
+
+      await updateSession(session.id, {
+        session_data: sessionData,
+        current_step: 'confirm',
+      });
+
+      const tzsAmount = sessionData.tokenSymbol === 'ETH'
+        ? Math.round(await convertCurrency(sessionData.cryptoAmount, 'ETH', 'TZS'))
+        : Math.round(sessionData.cryptoAmount);
+      const usdValue = await convertCurrency(tzsAmount, 'TZS', 'USD');
+
+      sessionData.tzsAmount = tzsAmount;
+
+      const confirmMessage = `💸 *Confirm Withdrawal*
+
+Amount: ${formatBalance(sessionData.cryptoAmount)} ${sessionData.tokenSymbol}
+
+You'll receive:
+${formatTZS(tzsAmount)} TZS
+≈ $${formatUSD(usdValue)} USD
+
+Phone: ${phoneNumber}`;
+
+      await sendButtonMessage(user.whatsapp_number, confirmMessage, [
+        { id: 'confirm_yes', title: '✅ Confirm' },
+        { id: 'confirm_no', title: '❌ Cancel' },
+      ]);
+    } else if (currentStep === 'confirm') {
+      if (messageText === 'confirm_yes') {
+        await sendWhatsAppMessage(user.whatsapp_number, '⏳ Processing...');
+
+        const orderId = generateOrderId(user.id);
+
+        const txData = {
+          user_id: user.id,
+          order_id: orderId,
+          transaction_type: 'withdraw',
+          token_symbol: sessionData.tokenSymbol,
+          amount_tzs: sessionData.tzsAmount,
+          amount_crypto: sessionData.cryptoAmount,
+          phone_number: sessionData.phoneNumber,
+          payment_channel: 'MPESA-TZ',
+          status: 'pending',
+        };
+
+        await createMobileMoneyTransaction(txData);
+
+        const zenoResult = await createWithdrawalOrder(
+          orderId,
+          sessionData.phoneNumber,
+          sessionData.tzsAmount
+        );
+
+        if (zenoResult.success) {
+          await sendWhatsAppMessage(
+            user.whatsapp_number,
+            `✅ *Withdrawal Initiated!*\n\nYou'll receive ${formatTZS(sessionData.tzsAmount)} TZS to ${sessionData.phoneNumber}`
+          );
+        } else {
+          await sendWhatsAppMessage(user.whatsapp_number, `❌ Failed: ${zenoResult.error}`);
+        }
+
+        await deleteSession(session.id);
+      } else {
+        await sendWhatsAppMessage(user.whatsapp_number, '❌ Cancelled.');
+        await deleteSession(session.id);
+      }
+    }
+  } catch (error) {
+    console.error('Error in withdrawal session:', error);
+    await sendWhatsAppMessage(user.whatsapp_number, '❌ Error.');
+    await deleteSession(session.id);
+  }
+}
+
+async function handleChamaCreateSession(user: any, session: any, messageText: string) {
+  const currentStep = session.current_step;
+  const sessionData = session.session_data || {};
+
+  try {
+    if (currentStep === 'ask_name') {
+      sessionData.name = messageText.trim();
+
+      await updateSession(session.id, {
+        session_data: sessionData,
+        current_step: 'ask_description',
+      });
+
+      await sendWhatsAppMessage(user.whatsapp_number, 'Enter Chama description:');
+    } else if (currentStep === 'ask_description') {
+      sessionData.description = messageText.trim();
+
+      const inviteCode = await callDatabaseFunction('generate_invite_code', {});
+
+      const chamaData = {
+        name: sessionData.name,
+        description: sessionData.description,
+        invite_code: inviteCode,
+        creator_id: user.id,
+        share_price_usd: 10,
+        weekly_minimum_contribution: 5,
+        loan_interest_rate: 5,
+        lockup_period_months: 3,
+        auto_investment_percentage: 10,
+        status: 'active',
+        member_count: 1,
+        eth_pool: 0,
+        tzs_pool: 0,
+      };
+
+      const chama = await createChama(chamaData);
+
+      const memberData = {
+        chama_id: chama.id,
+        user_id: user.id,
+        is_admin: true,
+        status: 'active',
+        eth_share: 0,
+        tzs_share: 0,
+        total_contributions: 0,
+      };
+
+      await createChamaMember(memberData);
+
+      // Deploy smart contract on blockchain
+      await sendWhatsAppMessage(user.whatsapp_number, '⏳ Deploying smart contract on blockchain...');
+
+      const blockchainResult = await createChamaOnChain({
+        name: sessionData.name,
+        description: sessionData.description,
+        inviteCode: inviteCode,
+        sharePriceUSD: 10,
+        weeklyMinimum: 5,
+        loanInterestRate: 5,
+        lockupMonths: 3,
+      });
+
+      if (blockchainResult.success && blockchainResult.chamaAddress) {
+        // Update chama with blockchain details
+        await updateChama(chama.id, {
+          contract_address: blockchainResult.chamaAddress,
+          creation_tx_hash: blockchainResult.txHash,
+          creation_explorer_link: blockchainResult.explorerLink,
+        });
+
+        await sendWhatsAppMessage(
+          user.whatsapp_number,
+          `✅ *Chama Created Successfully!*\n\n` +
+          `Name: ${sessionData.name}\n` +
+          `Invite Code: *${inviteCode}*\n` +
+          `Contract: ${blockchainResult.chamaAddress}\n\n` +
+          `🔍 View on Explorer:\n${blockchainResult.explorerLink}\n\n` +
+          `Share the invite code with members!`
+        );
+      } else {
+        await sendWhatsAppMessage(
+          user.whatsapp_number,
+          `✅ *Chama Created!*\n\n` +
+          `Name: ${sessionData.name}\n` +
+          `Invite Code: *${inviteCode}*\n\n` +
+          `⚠️ Blockchain deployment pending: ${blockchainResult.error}\n\n` +
+          `Share with members!`
+        );
+      }
+
+      await deleteSession(session.id);
+    }
+  } catch (error) {
+    console.error('Error creating Chama:', error);
+    await sendWhatsAppMessage(user.whatsapp_number, '❌ Error creating Chama.');
+    await deleteSession(session.id);
+  }
+}
+
+async function handleChamaJoinSession(user: any, session: any, messageText: string) {
+  try {
+    const inviteCode = messageText.trim().toUpperCase();
+    const chama = await getChamaByInviteCode(inviteCode);
+
+    if (!chama) {
+      await sendWhatsAppMessage(user.whatsapp_number, '❌ Invalid code.');
+      await deleteSession(session.id);
+      return;
+    }
+
+    if (chama.status !== 'active') {
+      await sendWhatsAppMessage(user.whatsapp_number, '❌ Chama not active.');
+      await deleteSession(session.id);
+      return;
+    }
+
+    const existingMember = await getChamaMemberByUserAndChama(user.id, chama.id);
+    if (existingMember) {
+      await sendWhatsAppMessage(user.whatsapp_number, '❌ Already a member.');
+      await deleteSession(session.id);
+      return;
+    }
+
+    const memberData = {
+      chama_id: chama.id,
+      user_id: user.id,
+      is_admin: false,
+      status: 'active',
+      eth_share: 0,
+      tzs_share: 0,
+      total_contributions: 0,
+    };
+
+    await createChamaMember(memberData);
+    await updateChama(chama.id, {
+      member_count: chama.member_count + 1,
+    });
+
+    // Join chama on blockchain if contract exists
+    if (chama.contract_address) {
+      await sendWhatsAppMessage(user.whatsapp_number, '⏳ Joining on blockchain...');
+
+      const joinResult = await joinChamaOnChain(chama.contract_address);
+
+      if (joinResult.success) {
+        await sendWhatsAppMessage(
+          user.whatsapp_number,
+          `✅ Joined ${chama.name}!\n\n` +
+          `🔍 Transaction:\n${joinResult.explorerLink}\n\n` +
+          `Type *chama* for options.`
+        );
+      } else {
+        await sendWhatsAppMessage(
+          user.whatsapp_number,
+          `✅ Joined ${chama.name}!\n\n` +
+          `⚠️ Blockchain join pending: ${joinResult.error}\n\n` +
+          `Type *chama* for options.`
+        );
+      }
+    } else {
+      await sendWhatsAppMessage(user.whatsapp_number, `✅ Joined ${chama.name}!\n\nType *chama* for options.`);
+    }
+
+    await notifyChamaMembers(
+      chama.id,
+      'New Member',
+      `👥 *${chama.name}*\n\nNew member joined: ${user.whatsapp_number}\n\nWelcome!`,
+      user.id
+    );
+
+    await deleteSession(session.id);
+  } catch (error) {
+    console.error('Error joining Chama:', error);
+    await sendWhatsAppMessage(user.whatsapp_number, '❌ Error joining.');
+    await deleteSession(session.id);
+  }
+}
+
+async function handleChamaContributeSession(user: any, session: any, messageText: string) {
+  const currentStep = session.current_step;
+  const sessionData = session.session_data || {};
+
+  try {
+    if (currentStep === 'select_chama') {
+      const chamaId = messageText.replace('chama_', '');
+      const chama = await getChamaById(chamaId);
+
+      if (!chama) {
+        await sendWhatsAppMessage(user.whatsapp_number, '❌ Chama not found.');
+        await deleteSession(session.id);
+        return;
+      }
+
+      sessionData.chamaId = chamaId;
+      sessionData.chamaName = chama.name;
+
+      await updateSession(session.id, {
+        session_data: sessionData,
+        current_step: 'ask_token',
+      });
+
+      await sendButtonMessage(user.whatsapp_number, '💰 *Contribute*\n\nSelect token:', [
+        { id: 'contribute_eth', title: 'ETH' },
+        { id: 'contribute_tzs', title: 'TZS' },
+      ]);
+    } else if (currentStep === 'ask_token') {
+      if (messageText === 'contribute_eth') {
+        sessionData.tokenSymbol = 'ETH';
+      } else if (messageText === 'contribute_tzs') {
+        sessionData.tokenSymbol = 'TZS';
+      } else {
+        await sendWhatsAppMessage(user.whatsapp_number, 'Select ETH or TZS');
+        return;
+      }
+
+      const balances = await getAllBalances(user.wallet_address);
+      const balance = sessionData.tokenSymbol === 'ETH' ? balances.eth : balances.tzs;
+
+      await updateSession(session.id, {
+        session_data: sessionData,
+        current_step: 'ask_amount',
+      });
+
+      await sendWhatsAppMessage(
+        user.whatsapp_number,
+        `💰 *Contribute to ${sessionData.chamaName}*\n\nBalance: ${formatBalance(balance)} ${sessionData.tokenSymbol}\n\nEnter amount:`
+      );
+    } else if (currentStep === 'ask_amount') {
+      const amount = parseFloat(messageText.trim());
+
+      if (isNaN(amount) || amount <= 0) {
+        await sendWhatsAppMessage(user.whatsapp_number, '❌ Invalid amount.');
+        return;
+      }
+
+      const balances = await getAllBalances(user.wallet_address);
+      const balance = sessionData.tokenSymbol === 'ETH' ? parseFloat(balances.eth) : parseFloat(balances.tzs);
+
+      if (amount > balance) {
+        await sendWhatsAppMessage(user.whatsapp_number, `❌ Insufficient: ${formatBalance(balance)} ${sessionData.tokenSymbol}`);
+        await deleteSession(session.id);
+        return;
+      }
+
+      sessionData.amount = amount;
+
+      await updateSession(session.id, {
+        session_data: sessionData,
+        current_step: 'verify_pin',
+      });
+
+      const tzsValue = sessionData.tokenSymbol === 'ETH'
+        ? await convertCurrency(amount, 'ETH', 'TZS')
+        : amount;
+      const usdValue = await convertCurrency(tzsValue, 'TZS', 'USD');
+
+      await sendWhatsAppMessage(
+        user.whatsapp_number,
+        `💰 *Confirm Contribution*\n\nChama: ${sessionData.chamaName}\nAmount: ${formatBalance(amount)} ${sessionData.tokenSymbol}\n≈ ${formatTZS(tzsValue)} TZS\n≈ $${formatUSD(usdValue)} USD\n\n🔐 Enter PIN:`
+      );
+    } else if (currentStep === 'verify_pin') {
+      const pin = messageText.trim();
+      const verifyResult = await verifyPin(user.id, pin);
+
+      if (!verifyResult.success) {
+        await sendWhatsAppMessage(user.whatsapp_number, `❌ ${verifyResult.error}`);
+        if (verifyResult.locked) await deleteSession(session.id);
+        return;
+      }
+
+      await sendWhatsAppMessage(user.whatsapp_number, '⏳ Processing...');
+
+      const chama = await getChamaById(sessionData.chamaId);
+      if (!chama) {
+        await sendWhatsAppMessage(user.whatsapp_number, '❌ Chama not found.');
+        await deleteSession(session.id);
+        return;
+      }
+
+      const member = await getChamaMemberByUserAndChama(user.id, sessionData.chamaId);
+      if (!member) {
+        await sendWhatsAppMessage(user.whatsapp_number, '❌ Not a member.');
+        await deleteSession(session.id);
+        return;
+      }
+
+      const tzsValue = sessionData.tokenSymbol === 'ETH'
+        ? await convertCurrency(sessionData.amount, 'ETH', 'TZS')
+        : sessionData.amount;
+      const usdValue = await convertCurrency(tzsValue, 'TZS', 'USD');
+
+      // Make on-chain contribution if contract exists
+      let explorerLink = '';
+      if (chama.contract_address) {
+        await sendWhatsAppMessage(user.whatsapp_number, '⏳ Processing blockchain transaction...');
+
+        const contributeResult = await contributeToChamaOnChain({
+          chamaAddress: chama.contract_address,
+          token: sessionData.tokenSymbol,
+          amount: sessionData.amount.toString(),
+          amountUSD: usdValue,
+        });
+
+        if (contributeResult.success) {
+          explorerLink = contributeResult.explorerLink || '';
+
+          // Record contribution in database
+          await createChamaContribution({
+            chama_id: sessionData.chamaId,
+            user_id: user.id,
+            member_id: member.id,
+            token_symbol: sessionData.tokenSymbol,
+            amount_crypto: sessionData.amount,
+            amount_usd: usdValue,
+            tx_hash: contributeResult.txHash,
+            explorer_link: explorerLink,
+            status: 'confirmed',
+            confirmed_at: new Date().toISOString(),
+          });
+
+          // Update member shares
+          if (sessionData.tokenSymbol === 'ETH') {
+            await updateChamaMember(member.id, {
+              eth_share: parseFloat(member.eth_share || 0) + sessionData.amount,
+              total_contributions: parseFloat(member.total_contributions || 0) + sessionData.amount
+            });
+            await updateChama(sessionData.chamaId, {
+              eth_pool: parseFloat(chama.eth_pool || 0) + sessionData.amount
+            });
+          } else {
+            await updateChamaMember(member.id, {
+              tzs_share: parseFloat(member.tzs_share || 0) + sessionData.amount,
+              total_contributions: parseFloat(member.total_contributions || 0) + sessionData.amount
+            });
+            await updateChama(sessionData.chamaId, {
+              tzs_pool: parseFloat(chama.tzs_pool || 0) + sessionData.amount
+            });
+          }
+        } else {
+          await sendWhatsAppMessage(user.whatsapp_number, `❌ Blockchain transaction failed: ${contributeResult.error}`);
+          await deleteSession(session.id);
+          return;
+        }
+      } else {
+        // Fallback to database-only if no contract
+        if (sessionData.tokenSymbol === 'ETH') {
+          await updateChamaMember(member.id, {
+            eth_share: parseFloat(member.eth_share || 0) + sessionData.amount,
+            total_contributions: parseFloat(member.total_contributions || 0) + sessionData.amount
+          });
+          await updateChama(sessionData.chamaId, {
+            eth_pool: parseFloat(chama.eth_pool || 0) + sessionData.amount
+          });
+        } else {
+          await updateChamaMember(member.id, {
+            tzs_share: parseFloat(member.tzs_share || 0) + sessionData.amount,
+            total_contributions: parseFloat(member.total_contributions || 0) + sessionData.amount
+          });
+          await updateChama(sessionData.chamaId, {
+            tzs_pool: parseFloat(chama.tzs_pool || 0) + sessionData.amount
+          });
+        }
+      }
+
+      await sendWhatsAppMessage(
+        user.whatsapp_number,
+        `✅ *Contribution Success!*\n\n` +
+        `Chama: ${sessionData.chamaName}\n` +
+        `Amount: ${formatBalance(sessionData.amount)} ${sessionData.tokenSymbol}\n` +
+        `≈ ${formatTZS(tzsValue)} TZS\n` +
+        `≈ $${formatUSD(usdValue)} USD\n\n` +
+        (explorerLink ? `🔍 View Transaction:\n${explorerLink}` : '')
+      );
+
+      // Notify members
+      await notifyChamaMembers(
+        sessionData.chamaId,
+        'New Contribution',
+        `💰 *${sessionData.chamaName}*\n\n${user.whatsapp_number} contributed ${formatBalance(sessionData.amount)} ${sessionData.tokenSymbol}\n≈ ${formatTZS(tzsValue)} TZS`,
+        user.id
+      );
+
+      await deleteSession(session.id);
+    }
+  } catch (error) {
+    console.error('Error in contribute session:', error);
+    await sendWhatsAppMessage(user.whatsapp_number, '❌ Error.');
+    await deleteSession(session.id);
+  }
+}
+
+async function handleLoanRequestSession(user: any, session: any, messageText: string) {
+  const currentStep = session.current_step;
+  const sessionData = session.session_data || {};
+
+  try {
+    if (currentStep === 'select_chama') {
+      const chamaId = messageText.replace('loan_chama_', '');
+      const chama = await getChamaById(chamaId);
+
+      if (!chama) {
+        await sendWhatsAppMessage(user.whatsapp_number, '❌ Chama not found.');
+        await deleteSession(session.id);
+        return;
+      }
+
+      sessionData.chamaId = chamaId;
+      sessionData.chamaName = chama.name;
+
+      await updateSession(session.id, {
+        session_data: sessionData,
+        current_step: 'ask_amount',
+      });
+
+      const tzsPool = parseFloat(chama.tzs_pool || 0);
+      const usdPool = await convertCurrency(tzsPool, 'TZS', 'USD');
+
+      await sendWhatsAppMessage(
+        user.whatsapp_number,
+        `📝 *Request Loan*\n\nChama: ${chama.name}\nAvailable: ${formatTZS(tzsPool)} TZS (≈ $${formatUSD(usdPool)})\n\nEnter loan amount in TZS:`
+      );
+    } else if (currentStep === 'ask_amount') {
+      const amount = parseFloat(messageText.trim());
+
+      if (isNaN(amount) || amount <= 0) {
+        await sendWhatsAppMessage(user.whatsapp_number, '❌ Invalid amount.');
+        return;
+      }
+
+      const chama = await getChamaById(sessionData.chamaId);
+      const availableTzs = parseFloat(chama.tzs_pool || 0);
+
+      if (amount > availableTzs) {
+        await sendWhatsAppMessage(
+          user.whatsapp_number,
+          `❌ Insufficient funds. Available: ${formatTZS(availableTzs)} TZS`
+        );
+        await deleteSession(session.id);
+        return;
+      }
+
+      sessionData.amount = amount;
+
+      await updateSession(session.id, {
+        session_data: sessionData,
+        current_step: 'ask_duration',
+      });
+
+      await sendWhatsAppMessage(user.whatsapp_number, 'Enter loan duration in months (e.g., 3, 6, 12):');
+    } else if (currentStep === 'ask_duration') {
+      const duration = parseInt(messageText.trim());
+
+      if (isNaN(duration) || duration < 1) {
+        await sendWhatsAppMessage(user.whatsapp_number, '❌ Invalid duration.');
+        return;
+      }
+
+      sessionData.duration = duration;
+
+      await updateSession(session.id, {
+        session_data: sessionData,
+        current_step: 'verify_pin',
+      });
+
+      const usdValue = await convertCurrency(sessionData.amount, 'TZS', 'USD');
+      const chama = await getChamaById(sessionData.chamaId);
+      const interestRate = chama.loan_interest_rate || 5;
+      const totalWithInterest = sessionData.amount * (1 + interestRate / 100);
+
+      await sendWhatsAppMessage(
+        user.whatsapp_number,
+        `📝 *Confirm Loan Request*\n\nChama: ${sessionData.chamaName}\nAmount: ${formatTZS(sessionData.amount)} TZS (≈ $${formatUSD(usdValue)})\nDuration: ${duration} months\nInterest: ${interestRate}%\nTotal Repay: ${formatTZS(totalWithInterest)} TZS\n\n🔐 Enter PIN:`
+      );
+    } else if (currentStep === 'verify_pin') {
+      const pin = messageText.trim();
+      const verifyResult = await verifyPin(user.id, pin);
+
+      if (!verifyResult.success) {
+        await sendWhatsAppMessage(user.whatsapp_number, `❌ ${verifyResult.error}`);
+        if (verifyResult.locked) await deleteSession(session.id);
+        return;
+      }
+
+      await sendWhatsAppMessage(user.whatsapp_number, '⏳ Processing...');
+
+      const chama = await getChamaById(sessionData.chamaId);
+      const member = await getChamaMemberByUserAndChama(user.id, sessionData.chamaId);
+
+      // Get all members for approval
+      const { data: allMembers } = await supabase
+        .from('chama_members')
+        .select('id')
+        .eq('chama_id', sessionData.chamaId)
+        .eq('status', 'active');
+
+      const interestRate = chama.loan_interest_rate || 5;
+      const totalWithInterest = sessionData.amount * (1 + interestRate / 100);
+
+      const loanData = {
+        chama_id: sessionData.chamaId,
+        borrower_id: user.id,
+        loan_amount: sessionData.amount,
+        outstanding_balance: totalWithInterest,
+        interest_rate: interestRate,
+        duration_months: sessionData.duration,
+        token_symbol: 'TZS',
+        status: 'pending',
+        approvals_required: allMembers?.length || 1,
+        approvals_received: 0,
+        denials_received: 0,
+      };
+
+      const loan = await createLoan(loanData);
+
+      await sendWhatsAppMessage(
+        user.whatsapp_number,
+        `✅ *Loan Request Submitted!*\n\nAmount: ${formatTZS(sessionData.amount)} TZS\n\nWaiting for member approval.`
+      );
+
+      // Notify all members
+      const usdValue = await convertCurrency(sessionData.amount, 'TZS', 'USD');
+      await notifyChamaMembers(
+        sessionData.chamaId,
+        'Loan Request',
+        `💵 *${sessionData.chamaName}*\n\nLoan Request from ${user.whatsapp_number}\n\nAmount: ${formatTZS(sessionData.amount)} TZS (≈ $${formatUSD(usdValue)})\nDuration: ${sessionData.duration} months\n\nReply *approve_${loan.id}* to approve\nReply *deny_${loan.id}* to deny`,
+        user.id
+      );
+
+      await deleteSession(session.id);
+    }
+  } catch (error) {
+    console.error('Error in loan request session:', error);
+    await sendWhatsAppMessage(user.whatsapp_number, '❌ Error.');
+    await deleteSession(session.id);
+  }
+}
+
+async function handleLoanPaySession(user: any, session: any, messageText: string) {
+  const currentStep = session.current_step;
+  const sessionData = session.session_data || {};
+
+  try {
+    if (currentStep === 'select_loan') {
+      const loanIndex = parseInt(messageText.replace('pay_loan_', ''));
+      const loan = sessionData.loans[loanIndex];
+
+      if (!loan) {
+        await sendWhatsAppMessage(user.whatsapp_number, '❌ Loan not found.');
+        await deleteSession(session.id);
+        return;
+      }
+
+      sessionData.loanId = loan.id;
+      sessionData.outstanding = loan.outstanding_balance;
+      sessionData.chamaName = loan.chamas.name;
+
+      await updateSession(session.id, {
+        session_data: sessionData,
+        current_step: 'ask_amount',
+      });
+
+      const usdValue = await convertCurrency(loan.outstanding_balance, 'TZS', 'USD');
+
+      await sendWhatsAppMessage(
+        user.whatsapp_number,
+        `💳 *Pay Loan*\n\nChama: ${loan.chamas.name}\nOutstanding: ${formatTZS(loan.outstanding_balance)} TZS (≈ $${formatUSD(usdValue)})\n\nEnter payment amount in TZS:`
+      );
+    } else if (currentStep === 'ask_amount') {
+      const amount = parseFloat(messageText.trim());
+
+      if (isNaN(amount) || amount <= 0) {
+        await sendWhatsAppMessage(user.whatsapp_number, '❌ Invalid amount.');
+        return;
+      }
+
+      if (amount > sessionData.outstanding) {
+        await sendWhatsAppMessage(
+          user.whatsapp_number,
+          `❌ Amount exceeds outstanding: ${formatTZS(sessionData.outstanding)} TZS`
+        );
+        return;
+      }
+
+      sessionData.amount = amount;
+
+      await updateSession(session.id, {
+        session_data: sessionData,
+        current_step: 'verify_pin',
+      });
+
+      const usdValue = await convertCurrency(amount, 'TZS', 'USD');
+
+      await sendWhatsAppMessage(
+        user.whatsapp_number,
+        `💳 *Confirm Payment*\n\nChama: ${sessionData.chamaName}\nAmount: ${formatTZS(amount)} TZS (≈ $${formatUSD(usdValue)})\n\n🔐 Enter PIN:`
+      );
+    } else if (currentStep === 'verify_pin') {
+      const pin = messageText.trim();
+      const verifyResult = await verifyPin(user.id, pin);
+
+      if (!verifyResult.success) {
+        await sendWhatsAppMessage(user.whatsapp_number, `❌ ${verifyResult.error}`);
+        if (verifyResult.locked) await deleteSession(session.id);
+        return;
+      }
+
+      await sendWhatsAppMessage(user.whatsapp_number, '⏳ Processing...');
+
+      // Update loan
+      const newBalance = sessionData.outstanding - sessionData.amount;
+      const updates: any = {
+        outstanding_balance: newBalance
+      };
+
+      if (newBalance <= 0) {
+        updates.status = 'paid';
+      }
+
+      await updateLoan(sessionData.loanId, updates);
+
+      await sendWhatsAppMessage(
+        user.whatsapp_number,
+        `✅ *Payment Success!*\n\nPaid: ${formatTZS(sessionData.amount)} TZS\nRemaining: ${formatTZS(newBalance)} TZS${newBalance <= 0 ? '\n\n🎉 Loan fully paid!' : ''}`
+      );
+
+      await deleteSession(session.id);
+    }
+  } catch (error) {
+    console.error('Error in loan pay session:', error);
+    await sendWhatsAppMessage(user.whatsapp_number, '❌ Error.');
+    await deleteSession(session.id);
+  }
+}
+
+async function handleRecoverySession(user: any, session: any, messageText: string) {
+  const currentStep = session.current_step;
+  const sessionData = session.session_data || {};
+
+  try {
+    if (currentStep === 'verify_pin') {
+      const pin = messageText.trim();
+      const verifyResult = await verifyPin(user.id, pin);
+
+      if (!verifyResult.success) {
+        await sendWhatsAppMessage(user.whatsapp_number, `❌ ${verifyResult.error}`);
+        if (verifyResult.locked) await deleteSession(session.id);
+        return;
+      }
+
+      await updateSession(session.id, {
+        session_data: sessionData,
+        current_step: 'show_options',
+      });
+
+      await sendButtonMessage(user.whatsapp_number, '🔑 *Recovery Options*\n\nSelect:', [
+        { id: 'recover_mnemonic', title: 'Recovery Phrase' },
+        { id: 'change_pin', title: 'Change PIN' },
+      ]);
+    } else if (currentStep === 'show_options') {
+      if (messageText === 'recover_mnemonic') {
+        const mnemonic = decrypt(user.encrypted_mnemonic);
+        await sendWhatsAppMessage(
+          user.whatsapp_number,
+          `⚠️ *IMPORTANT*\n\nYour recovery phrase:\n\`${mnemonic}\`\n\n• Never share\n• Store safely\n• Anyone with this can access funds`
+        );
+        await deleteSession(session.id);
+      } else if (messageText === 'change_pin') {
+        await updateSession(session.id, {
+          session_data: {},
+          current_step: 'ask_new_pin',
+        });
+        await sendWhatsAppMessage(user.whatsapp_number, '🔐 *Change PIN*\n\nEnter new PIN (4-6 digits):');
+      }
+    } else if (currentStep === 'ask_new_pin') {
+      const pin = messageText.trim();
+      if (!isValidPinFormat(pin)) {
+        await sendWhatsAppMessage(user.whatsapp_number, '❌ Invalid. Enter 4-6 digits:');
+        return;
+      }
+      sessionData.newPin = pin;
+      await updateSession(session.id, {
+        session_data: sessionData,
+        current_step: 'confirm_new_pin',
+      });
+      await sendWhatsAppMessage(user.whatsapp_number, '🔐 Confirm new PIN:');
+    } else if (currentStep === 'confirm_new_pin') {
+      const confirmPin = messageText.trim();
+      if (confirmPin !== sessionData.newPin) {
+        await sendWhatsAppMessage(user.whatsapp_number, '❌ PINs do not match. Enter new PIN:');
+        await updateSession(session.id, {
+          session_data: {},
+          current_step: 'ask_new_pin',
+        });
+        return;
+      }
+
+      const hashedPin = hashPin(sessionData.newPin);
+      await updateUserPin(user.id, {
+        encrypted_pin: hashedPin,
+        failed_attempts: 0,
+        locked_until: null,
+      });
+
+      await sendWhatsAppMessage(user.whatsapp_number, '✅ *PIN changed!*\n\nNew PIN is active.');
+      await deleteSession(session.id);
+    }
+  } catch (error) {
+    console.error('Error in recovery session:', error);
+    await sendWhatsAppMessage(user.whatsapp_number, '❌ Error.');
+    await deleteSession(session.id);
+  }
+}
+
+async function handleSessionMessage(user: any, session: any, messageText: string) {
+  const sessionType = session.session_type;
+
+  if (sessionType === 'setup_pin') {
+    await handlePinSetupSession(user, session, messageText);
+  } else if (sessionType === 'send_crypto') {
+    await handleSendCryptoSession(user, session, messageText);
+  } else if (sessionType === 'mobile_money_deposit') {
+    await handleMobileMoneyDepositSession(user, session, messageText);
+  } else if (sessionType === 'mobile_money_withdraw') {
+    await handleMobileMoneyWithdrawSession(user, session, messageText);
+  } else if (sessionType === 'chama_create') {
+    await handleChamaCreateSession(user, session, messageText);
+  } else if (sessionType === 'chama_join') {
+    await handleChamaJoinSession(user, session, messageText);
+  } else if (sessionType === 'chama_contribute') {
+    await handleChamaContributeSession(user, session, messageText);
+  } else if (sessionType === 'loan_request') {
+    await handleLoanRequestSession(user, session, messageText);
+  } else if (sessionType === 'loan_pay') {
+    await handleLoanPaySession(user, session, messageText);
+  } else if (sessionType === 'recovery') {
+    await handleRecoverySession(user, session, messageText);
+  } else {
+    console.warn(`Unknown session: ${sessionType}`);
+    await deleteSession(session.id);
+  }
+}
+
+// ============================================================================
+// MAIN MESSAGE HANDLER
+// ============================================================================
+function parseIncomingMessage(webhookBody: any) {
+  try {
+    const entry = webhookBody.entry?.[0];
+    const change = entry?.changes?.[0];
+    const value = change?.value;
+    const message = value?.messages?.[0];
+    if (!message) return null;
+
+    return {
+      from: message.from,
+      id: message.id,
+      timestamp: message.timestamp,
+      type: message.type,
+      text: message.text?.body,
+      interactive: message.interactive,
+      button: message.interactive?.button_reply,
+      listReply: message.interactive?.list_reply,
+    };
+  } catch (error) {
+    console.error('Error parsing message:', error);
+    return null;
+  }
+}
+
+async function handleIncomingMessage(from: string, messageData: any, messageId: string) {
+  try {
+    let user = await getUserByWhatsApp(from);
+
+    if (!user) {
+      await handleNewUser(from);
+      return;
+    }
+
+    await updateUser(user.id, { last_active: new Date().toISOString() });
+
+    const session = await getActiveSession(user.id);
+    let messageText = '';
+
+    if (messageData.type === 'text') {
+      messageText = messageData.text?.toLowerCase().trim() || '';
+    } else if (messageData.type === 'interactive') {
+      if (messageData.interactive?.type === 'button_reply') {
+        messageText = messageData.interactive.button_reply.id;
+      } else if (messageData.interactive?.type === 'list_reply') {
+        messageText = messageData.interactive.list_reply.id;
+      }
+    }
+
+    if (session) {
+      await handleSessionMessage(user, session, messageText);
+    } else {
+      await handleCommand(user, messageText);
+    }
+  } catch (error) {
+    console.error('Error handling message:', error);
+    await sendWhatsAppMessage(from, '❌ Error occurred. Try *menu*.');
+  }
+}
+
+// ============================================================================
+// WEBHOOK HANDLER
+// ============================================================================
+Deno.serve(async (req: Request) => {
+  if (req.method === 'OPTIONS') {
+    return new Response(null, { status: 200, headers: corsHeaders });
+  }
+
+  try {
+    const url = new URL(req.url);
+
+    if (req.method === 'GET') {
+      const mode = url.searchParams.get('hub.mode');
+      const token = url.searchParams.get('hub.verify_token');
+      const challenge = url.searchParams.get('hub.challenge');
+
+      if (mode === 'subscribe' && token === META_WEBHOOK_VERIFY_TOKEN) {
+        console.log('✅ Webhook verified');
+        return new Response(challenge, { status: 200, headers: corsHeaders });
+      } else {
+        console.error('❌ Verification failed');
+        return new Response('Forbidden', { status: 403, headers: corsHeaders });
+      }
+    }
+
+    if (req.method === 'POST') {
+      const body = await req.json();
+      const message = parseIncomingMessage(body);
+
+      if (message) {
+        const displayText = message.text || message.button?.id || message.listReply?.id || '[interactive]';
+        console.log(`📨 ${message.from}: ${displayText}`);
+        handleIncomingMessage(message.from, message, message.id);
+      }
+
+      return new Response(JSON.stringify({ success: true }), {
+        status: 200,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+
+    return new Response(JSON.stringify({ error: 'Not found' }), {
+      status: 404,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  } catch (error) {
+    console.error('Error:', error);
+    return new Response(JSON.stringify({ error: 'Internal server error' }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  }
+});
